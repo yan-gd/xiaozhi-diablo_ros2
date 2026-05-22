@@ -1,0 +1,19 @@
+# Python/runtime generated files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ROS/colcon generated workspace directories
+/build/
+/install/
+/log/
+
+# Local runtime logs and pid files
+logs/
+*.log
+*.pid
+
+# Local environment files may contain private endpoints or tokens
+.env
+*.env
+!*.env.example

@@ -11,8 +11,7 @@ void diabloCtrlNode::heart_beat_loop(void){
         {
             if(!pMovementCtrl->in_control())
             {
-                // RCLCPP_INFO(this->get_logger(), "get control.");
-                pMovementCtrl->obtain_control();
+                usleep(180000);
                 continue;
             }
             
@@ -23,18 +22,27 @@ void diabloCtrlNode::heart_beat_loop(void){
                 pMovementCtrl->ctrl_data.roll = ctrl_msg_.value.roll;
                 pMovementCtrl->ctrl_data.pitch = ctrl_msg_.value.pitch;
                 pMovementCtrl->ctrl_data.leg_split = ctrl_msg_.value.leg_split;
-                pMovementCtrl->SendMovementCtrlCmd();
+                uint8_t result = pMovementCtrl->SendMovementCtrlCmd();
+                if(result)
+                {
+                    RCLCPP_WARN_THROTTLE(
+                        this->get_logger(),
+                        *this->get_clock(),
+                        1000,
+                        "Heartbeat SendMovementCtrlCmd failed: result=%u ctrl_mode=%u robot_mode=%u error=%u warning=%u",
+                        result,
+                        pTelemetry->status.ctrl_mode,
+                        pTelemetry->status.robot_mode,
+                        pTelemetry->status.error,
+                        pTelemetry->status.warning);
+                }
                 
             }else{
-                if(ctrl_msg_.mode.stand_mode)
-                    pMovementCtrl->SendTransformUpCmd();
-                else{
-                    pMovementCtrl->SendTransformDownCmd();
-                }
-                pMovementCtrl->ctrl_mode_data.height_ctrl_mode = ctrl_msg_.mode.height_ctrl_mode;
-                pMovementCtrl->ctrl_mode_data.pitch_ctrl_mode = ctrl_msg_.mode.pitch_ctrl_mode;
-                pMovementCtrl->ctrl_mode_data.roll_ctrl_mode = ctrl_msg_.mode.roll_ctrl_mode;
-                pMovementCtrl->SendMovementModeCtrlCmd();
+                // Transform and mode commands are one-shot requests. Replaying
+                // them in the heartbeat can flood the serial link when the
+                // controller rejects a posture change.
+                usleep(180000);
+                continue;
             }
             usleep(180000);
         }
@@ -48,13 +56,48 @@ void diabloCtrlNode::run_(void){
 
 void diabloCtrlNode::Motion_callback(const motion_msgs::msg::MotionCtrl::SharedPtr msg)
 {
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        1000,
+        "MotionCmd callback entered: mode_mark=%d forward=%.3f left=%.3f up=%.3f in_control=%d",
+        msg->mode_mark,
+        msg->value.forward,
+        msg->value.left,
+        msg->value.up,
+        pMovementCtrl->in_control());
     onSend = false;
-    // RCLCPP_INFO(this->get_logger(), "control mode %d",!pMovementCtrl->in_control());
     if(!pMovementCtrl->in_control())
     {
-        pMovementCtrl->obtain_control();
-        return;
+        uint8_t result = pMovementCtrl->obtain_control();
+        if(!pMovementCtrl->in_control())
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "drop MotionCmd because movement control is not obtained: result=%u ctrl_mode=%u robot_mode=%u error=%u warning=%u",
+                result,
+                pTelemetry->status.ctrl_mode,
+                pTelemetry->status.robot_mode,
+                pTelemetry->status.error,
+                pTelemetry->status.warning);
+            onSend = true;
+            return;
+        }
     }
+
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        1000,
+        "MotionCmd received: mode_mark=%d forward=%.3f left=%.3f up=%.3f stand=%d",
+        msg->mode_mark,
+        msg->value.forward,
+        msg->value.left,
+        msg->value.up,
+        msg->mode.stand_mode);
+
     ctrl_msg_.mode = msg->mode;
     ctrl_msg_.mode_mark = msg->mode_mark;
     ctrl_msg_.value = msg->value;
@@ -66,13 +109,54 @@ void diabloCtrlNode::Motion_callback(const motion_msgs::msg::MotionCtrl::SharedP
         pMovementCtrl->ctrl_data.roll = msg->value.roll;
         pMovementCtrl->ctrl_data.pitch = msg->value.pitch;
         pMovementCtrl->ctrl_data.leg_split = msg->value.leg_split;
-        pMovementCtrl->SendMovementCtrlCmd();
+        uint8_t result = pMovementCtrl->SendMovementCtrlCmd();
+        if(result)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "SendMovementCtrlCmd failed: result=%u ctrl_mode=%u robot_mode=%u error=%u warning=%u",
+                result,
+                pTelemetry->status.ctrl_mode,
+                pTelemetry->status.robot_mode,
+                pTelemetry->status.error,
+                pTelemetry->status.warning);
+        }
+        else if(msg->value.forward != 0.0 || msg->value.left != 0.0)
+        {
+            RCLCPP_INFO_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "SendMovementCtrlCmd ok: forward=%.3f left=%.3f up=%.3f ctrl_mode=%u robot_mode=%u",
+                msg->value.forward,
+                msg->value.left,
+                msg->value.up,
+                pTelemetry->status.ctrl_mode,
+                pTelemetry->status.robot_mode);
+        }
     }else{
  
+        uint8_t transform_result = 0;
         if(msg->mode.stand_mode)
-            pMovementCtrl->SendTransformUpCmd();
+            transform_result = pMovementCtrl->SendTransformUpCmd();
         else{
-            pMovementCtrl->SendTransformDownCmd();
+            transform_result = pMovementCtrl->SendTransformDownCmd();
+        }
+        if(transform_result)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Transform command failed: result=%u stand=%d ctrl_mode=%u robot_mode=%u error=%u warning=%u",
+                transform_result,
+                msg->mode.stand_mode,
+                pTelemetry->status.ctrl_mode,
+                pTelemetry->status.robot_mode,
+                pTelemetry->status.error,
+                pTelemetry->status.warning);
         }
         
         // RCLCPP_INFO(this->get_logger(), "try to jump.");
@@ -86,7 +170,20 @@ void diabloCtrlNode::Motion_callback(const motion_msgs::msg::MotionCtrl::SharedP
         pMovementCtrl->ctrl_mode_data.height_ctrl_mode = msg->mode.height_ctrl_mode;
         pMovementCtrl->ctrl_mode_data.pitch_ctrl_mode = msg->mode.pitch_ctrl_mode;
         pMovementCtrl->ctrl_mode_data.roll_ctrl_mode = msg->mode.roll_ctrl_mode;
-        pMovementCtrl->SendMovementModeCtrlCmd();
+        uint8_t mode_result = pMovementCtrl->SendMovementModeCtrlCmd();
+        if(mode_result)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "SendMovementModeCtrlCmd failed: result=%u ctrl_mode=%u robot_mode=%u error=%u warning=%u",
+                mode_result,
+                pTelemetry->status.ctrl_mode,
+                pTelemetry->status.robot_mode,
+                pTelemetry->status.error,
+                pTelemetry->status.warning);
+        }
     }
     onSend = true;
 }
@@ -107,12 +204,16 @@ int main(int argc, char **argv)
     auto node = std::make_shared<diabloCtrlNode>("diablo_ctrl_node");
 
     DIABLO::OSDK::HAL_Pi Hal;
-    if(Hal.init("/dev/ttyS3")) return -1;
+    if(Hal.init("/dev/ttyAMA0")) return -1;
 
     DIABLO::OSDK::Vehicle vehicle(&Hal);                     
     if(vehicle.init()) return -1;
 
-    vehicle.telemetry->activate();
+    if(vehicle.telemetry->activate())
+    {
+        RCLCPP_ERROR(node->get_logger(), "Failed to activate Diablo telemetry over serial. Check robot power, serial wiring, and /dev/ttyAMA0.");
+        return -1;
+    }
 
     diablo_imu_publisher imuPublisher(node,&vehicle);
     imuPublisher.imu_pub_init();
@@ -125,6 +226,11 @@ int main(int argc, char **argv)
 
     diablo_body_state_publisher bodyStatePublisher(node,&vehicle);
     bodyStatePublisher.body_pub_init();
+
+    if(vehicle.telemetry->configUpdate())
+    {
+        RCLCPP_WARN(node->get_logger(), "Diablo telemetry topic configuration did not receive an ACK after retries; motion control will continue, but sensor topics may be stale.");
+    }
 
     // vehicle.telemetry->enableLog(DIABLO::OSDK::TOPIC_POWER);
     // vehicle.telemetry->setMaxSpeed(1.0);

@@ -1,0 +1,190 @@
+# Xiaozhi Robot Control
+
+这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
+它默认使用 `ROS_DOMAIN_ID=5`，要和机器人上的控制节点保持一致。
+
+## 架构
+
+```text
+xiaozhi.me MCP 接入点
+  <-> scripts/xiaozhi_mcp_pipe.py
+  <-> scripts/run_robot_mcp_stdio.sh
+  <-> xiaozhi_robot_control.robot_mcp_server
+  <-> ROS2 /diablo/MotionCmd
+  <-> diablo_ctrl_node
+  <-> 下位机运动控制板
+```
+
+树莓派主动连接 `xiaozhi.me` 暴露的 MCP 接入点，所以不需要把树莓派暴露到公网。
+
+## 暴露给小智的工具
+
+- `robot_stop`
+- `robot_move_forward(speed, duration_ms)`
+- `robot_move_backward(speed, duration_ms)`
+- `robot_turn_left(speed, duration_ms)`
+- `robot_turn_right(speed, duration_ms)`
+- `robot_raise_body(value, duration_ms)`
+- `robot_lower_body(value, duration_ms)`
+- `robot_pitch_up(value, duration_ms)`
+- `robot_pitch_down(value, duration_ms)`
+- `robot_roll_left(value, duration_ms)`
+- `robot_roll_right(value, duration_ms)`
+- `robot_reset_body_pose`
+- `robot_get_status`
+
+`scripts/run_robot_mcp_stdio.sh` 默认暴露站立/趴下动作。需要关闭时设置：
+
+```bash
+export DIABLO_ENABLE_POSTURE_TOOLS=0
+```
+
+开启时会额外暴露：
+
+- `robot_stand_up`
+- `robot_stand_down`
+
+暂不默认暴露跳跃、分腿舞蹈、控制模式切换等更激烈或更容易误触发的手柄动作。
+
+## 安全限幅
+
+默认限幅可以通过环境变量调整：
+
+```bash
+export DIABLO_MAX_LINEAR_SPEED=0.5
+export DIABLO_MAX_TURN_SPEED=0.8
+export DIABLO_DEFAULT_LINEAR_SPEED=0.5
+export DIABLO_DEFAULT_TURN_SPEED=0.6
+export DIABLO_MAX_DURATION_MS=2000
+export DIABLO_MIN_DURATION_MS=1000
+export DIABLO_DEFAULT_DURATION_MS=1200
+export DIABLO_DEFAULT_UP=0.0
+export DIABLO_MAX_VERTICAL_SPEED=1.0
+export DIABLO_DEFAULT_VERTICAL_SPEED=0.5
+export DIABLO_STAND_UP_HEIGHT=1.0
+export DIABLO_STAND_UP_HEIGHT_PUBLISH_MS=1200
+export DIABLO_MAX_PITCH=0.5
+export DIABLO_DEFAULT_PITCH=0.5
+export DIABLO_MAX_ROLL=0.1
+export DIABLO_DEFAULT_ROLL=0.1
+```
+
+每次移动和姿态微调工具调用都会在 `duration_ms` 后自动发布中立命令。
+`robot_stand_up` 会先发送站起命令，然后按 `DIABLO_STAND_UP_HEIGHT` 继续发布高度命令，让机器人站到最大高度。
+
+## 构建
+
+```bash
+cd ~/diablo_ws
+source /opt/ros/foxy/setup.bash
+colcon build --symlink-install --packages-select xiaozhi_robot_control
+source install/setup.bash
+```
+
+## 启动机器人控制节点
+
+`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会设置 `ROS_DOMAIN_ID=5`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
+
+```bash
+cd ~/diablo_ws/src/xiaozhi_robot_control
+./scripts/run_diablo_ctrl_node_udp.sh
+```
+
+如果需要后台运行：
+
+```bash
+systemd-run --user --unit=diablo-ctrl-node --description=diablo-ctrl-node \
+  ~/diablo_ws/src/xiaozhi_robot_control/scripts/run_diablo_ctrl_node_udp.sh
+```
+
+## 开机自启
+
+安装并启用用户 systemd 服务：
+
+```bash
+cd ~/diablo_ws/src/xiaozhi_robot_control
+./scripts/install_user_services.sh
+```
+
+这个脚本会安装并启用：
+
+- `diablo-ctrl-node.service`
+- `xiaozhi-mcp-bridge.service`
+
+首次安装会创建环境文件：
+
+```bash
+~/.config/xiaozhi_robot_control/env
+```
+
+把里面的 `MCP_ENDPOINT` 改成小智后台复制的接入点后，再启动小智 bridge：
+
+```bash
+systemctl --user start xiaozhi-mcp-bridge.service
+```
+
+如果需要未登录桌面也能开机启动用户服务，执行一次：
+
+```bash
+sudo loginctl enable-linger diablo
+```
+
+查看状态和日志：
+
+```bash
+systemctl --user status diablo-ctrl-node.service
+systemctl --user status xiaozhi-mcp-bridge.service
+journalctl --user -u diablo-ctrl-node.service -f
+journalctl --user -u xiaozhi-mcp-bridge.service -f
+```
+
+## 本地测试 MCP 工具
+
+```bash
+cd ~/diablo_ws/src/xiaozhi_robot_control
+./scripts/local_mcp_smoke_test.py
+```
+
+这个测试会初始化 MCP、列出工具，并调用一次 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
+
+## 连接 xiaozhi.me
+
+在小智后台复制 MCP 接入点，例如：
+
+```bash
+export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
+```
+
+本目录已经内置了一个轻量版 `scripts/xiaozhi_mcp_pipe.py`，不需要额外准备官方 `mcp_pipe.py`。
+
+```bash
+export ROS_DOMAIN_ID=5
+cd ~/diablo_ws/src/xiaozhi_robot_control
+./scripts/run_with_xiaozhi_endpoint.sh
+```
+
+启动后到 `xiaozhi.me` 后台刷新 MCP 状态。在线后，小智就可以调用本目录暴露的 `robot_*` 工具。
+
+查看后台日志：
+
+```bash
+journalctl --user -u diablo-ctrl-node.service -f
+journalctl --user -u xiaozhi-mcp-bridge.service -f
+```
+
+## 推荐语音说法
+
+- “小智，让机器人停下”
+- “小智，让机器人向前走一秒”
+- “小智，让机器人向后退半秒”
+- “小智，让机器人左转一下”
+- “小智，让机器人抬高一点”
+- “小智，让机器人降低一点”
+- “小智，让机器人抬头一点”
+- “小智，让机器人低头一点”
+- “小智，让机器人向左倾斜一点”
+- “小智，让机器人向右倾斜一点”
+- “小智，让机器人姿态回正”
+- “小智，让机器人站起来”
+- “小智，让机器人趴下”
+- “小智，查询机器人状态”

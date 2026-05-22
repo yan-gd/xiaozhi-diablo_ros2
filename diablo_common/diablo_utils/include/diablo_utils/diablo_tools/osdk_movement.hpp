@@ -30,6 +30,7 @@ public:
         ctrl_mode_data.split_ctrl_mode=0;
         ctrl_mode_data.roll_ctrl_mode=0;
         ctrl_mode_data.yaw_ctrl_mode=1;
+        memset(&transform_data, 0, sizeof(OSDK_Transform_Cmd_t));
         transform_data.transform_up = 0;
         transform_data.transform_down = 0;
         ctrl_data.up = 1.0f;
@@ -157,4 +158,3 @@ private:
 
 }
 }
-

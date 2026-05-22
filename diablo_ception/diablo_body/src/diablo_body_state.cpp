@@ -10,7 +10,6 @@ void diablo_body_state_publisher::body_pub_init(void)
     timer_ = this->node_ptr->create_wall_timer(100ms,std::bind(&diablo_body_state_publisher::lazyPublisher, this));
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_STATUS, OSDK_PUSH_DATA_10Hz);
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_RC, OSDK_PUSH_DATA_OFF);
-    this->vehicle->telemetry->configUpdate(); 
 }
 
 

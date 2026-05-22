@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""A small stdio MCP server that publishes safe Diablo robot commands.
+
+This file intentionally avoids third-party MCP packages so it can run on the
+robot with only ROS2 Python packages installed. It implements the small subset
+of JSON-RPC methods needed by MCP clients such as xiaozhi mcp_pipe.
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+from typing import Any, Callable, Dict, Iterable, Optional
+
+import rclpy
+from motion_msgs.msg import MotionCtrl, RobotStatus
+from rclpy.node import Node
+from sensor_msgs.msg import BatteryState
+
+
+JsonDict = Dict[str, Any]
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+class DiabloRobotBridge:
+    """Translate high-level robot actions into /diablo/MotionCmd messages."""
+
+    def __init__(self) -> None:
+        self.motion_topic = os.environ.get("DIABLO_MOTION_TOPIC", "diablo/MotionCmd")
+        self.status_topic = os.environ.get("DIABLO_STATUS_TOPIC", "diablo/sensor/Body_state")
+        self.battery_topic = os.environ.get("DIABLO_BATTERY_TOPIC", "diablo/sensor/Battery")
+
+        self.max_linear_speed = _env_float("DIABLO_MAX_LINEAR_SPEED", 0.5)
+        self.max_turn_speed = _env_float("DIABLO_MAX_TURN_SPEED", 0.8)
+        self.default_linear_speed = _env_float("DIABLO_DEFAULT_LINEAR_SPEED", self.max_linear_speed)
+        self.default_turn_speed = _env_float("DIABLO_DEFAULT_TURN_SPEED", min(0.6, self.max_turn_speed))
+        self.max_duration_ms = _env_int("DIABLO_MAX_DURATION_MS", 2000)
+        self.min_duration_ms = _env_int("DIABLO_MIN_DURATION_MS", 1000)
+        self.default_duration_ms = _env_int("DIABLO_DEFAULT_DURATION_MS", 1200)
+        self.default_up = _env_float("DIABLO_DEFAULT_UP", 0.0)
+        self.max_vertical_speed = _env_float("DIABLO_MAX_VERTICAL_SPEED", 1.0)
+        self.default_vertical_speed = _env_float(
+            "DIABLO_DEFAULT_VERTICAL_SPEED",
+            min(0.5, self.max_vertical_speed),
+        )
+        self.stand_up_height = _env_float("DIABLO_STAND_UP_HEIGHT", min(1.0, self.max_vertical_speed))
+        self.stand_up_height_publish_ms = _env_int("DIABLO_STAND_UP_HEIGHT_PUBLISH_MS", 1200)
+        self.max_pitch = _env_float("DIABLO_MAX_PITCH", 0.5)
+        self.default_pitch = _env_float("DIABLO_DEFAULT_PITCH", min(0.5, self.max_pitch))
+        self.max_roll = _env_float("DIABLO_MAX_ROLL", 0.1)
+        self.default_roll = _env_float("DIABLO_DEFAULT_ROLL", min(0.1, self.max_roll))
+        self.action_reset_ms = _env_int("DIABLO_ACTION_RESET_MS", 300)
+        self.command_period_ms = _env_int("DIABLO_COMMAND_PERIOD_MS", 20)
+        self.stop_repeat_count = _env_int("DIABLO_STOP_REPEAT_COUNT", 30)
+        self.wait_for_subscriber_ms = _env_int("DIABLO_WAIT_FOR_SUBSCRIBER_MS", 2000)
+        self.discovery_settle_ms = _env_int("DIABLO_DISCOVERY_SETTLE_MS", 1000)
+        self.enable_posture_tools = _env_bool("DIABLO_ENABLE_POSTURE_TOOLS", False)
+
+        rclpy.init(args=None)
+        self.node: Node = rclpy.create_node("xiaozhi_robot_mcp_bridge")
+        self.publisher = self.node.create_publisher(MotionCtrl, self.motion_topic, 10)
+        self.node.create_subscription(RobotStatus, self.status_topic, self._status_callback, 10)
+        self.node.create_subscription(BatteryState, self.battery_topic, self._battery_callback, 10)
+
+        self._lock = threading.Lock()
+        self._latest_status: Optional[RobotStatus] = None
+        self._latest_status_time = 0.0
+        self._latest_battery: Optional[BatteryState] = None
+        self._latest_battery_time = 0.0
+        self._motion_subscriber_seen = False
+
+        self._spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
+        self._spin_thread.start()
+        self._log(
+            "robot MCP bridge ready: motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s"
+            % (
+                self.motion_topic,
+                self.max_linear_speed,
+                self.max_turn_speed,
+                self.default_linear_speed,
+                self.min_duration_ms,
+                self.max_duration_ms,
+                self.default_up,
+                self.default_vertical_speed,
+                self.stand_up_height,
+                self.default_pitch,
+                self.default_roll,
+                os.environ.get("ROS_DOMAIN_ID", ""),
+                os.environ.get("RMW_IMPLEMENTATION", ""),
+                os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", ""),
+            )
+        )
+
+    def shutdown(self) -> None:
+        try:
+            self.stop()
+        except Exception as exc:  # pragma: no cover - best effort shutdown
+            self._log("stop during shutdown failed: %s" % exc)
+        try:
+            self.node.destroy_node()
+        finally:
+            rclpy.shutdown()
+
+    def tool_definitions(self) -> Iterable[JsonDict]:
+        tools = [
+            {
+                "name": "robot_stop",
+                "description": "Stop the robot immediately by publishing a zero motion command.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "robot_move_forward",
+                "description": "Move the robot forward for a short bounded duration, then stop automatically.",
+                "inputSchema": self._speed_duration_schema("Forward speed in meters per second."),
+            },
+            {
+                "name": "robot_move_backward",
+                "description": "Move the robot backward for a short bounded duration, then stop automatically.",
+                "inputSchema": self._speed_duration_schema("Backward speed in meters per second."),
+            },
+            {
+                "name": "robot_turn_left",
+                "description": "Turn the robot left for a short bounded duration, then stop automatically.",
+                "inputSchema": self._turn_duration_schema("Left turn angular speed in radians per second."),
+            },
+            {
+                "name": "robot_turn_right",
+                "description": "Turn the robot right for a short bounded duration, then stop automatically.",
+                "inputSchema": self._turn_duration_schema("Right turn angular speed in radians per second."),
+            },
+            {
+                "name": "robot_raise_body",
+                "description": "Raise the robot body briefly using the same vertical control as the teleop up keys, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive vertical command value. Matches the teleop up control.",
+                    self.default_vertical_speed,
+                    self.max_vertical_speed,
+                ),
+            },
+            {
+                "name": "robot_lower_body",
+                "description": "Lower the robot body briefly using the same vertical control as the teleop down key, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive vertical command value. The server sends it as a negative up command.",
+                    self.default_vertical_speed,
+                    self.max_vertical_speed,
+                ),
+            },
+            {
+                "name": "robot_pitch_up",
+                "description": "Tilt the robot body pitch upward briefly, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive pitch command value.",
+                    self.default_pitch,
+                    self.max_pitch,
+                ),
+            },
+            {
+                "name": "robot_pitch_down",
+                "description": "Tilt the robot body pitch downward briefly, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive pitch command value. The server sends it as a negative pitch command.",
+                    self.default_pitch,
+                    self.max_pitch,
+                ),
+            },
+            {
+                "name": "robot_roll_left",
+                "description": "Lean the robot body left briefly, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive roll command value. The server sends it as a negative roll command.",
+                    self.default_roll,
+                    self.max_roll,
+                ),
+            },
+            {
+                "name": "robot_roll_right",
+                "description": "Lean the robot body right briefly, then stop automatically.",
+                "inputSchema": self._axis_duration_schema(
+                    "Positive roll command value.",
+                    self.default_roll,
+                    self.max_roll,
+                ),
+            },
+            {
+                "name": "robot_reset_body_pose",
+                "description": "Reset motion, vertical, pitch, roll, and leg split commands to neutral.",
+                "inputSchema": self._empty_schema(),
+            },
+            {
+                "name": "robot_get_status",
+                "description": "Read the latest robot status and battery data received by ROS2.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        ]
+        if self.enable_posture_tools:
+            tools.extend(
+                [
+                    {
+                        "name": "robot_stand_up",
+                        "description": "Send a one-shot stand-up command, then command maximum body height.",
+                        "inputSchema": self._empty_schema(),
+                    },
+                    {
+                        "name": "robot_stand_down",
+                        "description": "Send a one-shot stand-down command, then reset to zero motion.",
+                        "inputSchema": self._empty_schema(),
+                    },
+                ]
+            )
+        return tools
+
+    def call_tool(self, name: str, arguments: JsonDict) -> JsonDict:
+        self._log("tool call: %s arguments=%s" % (name, json.dumps(arguments or {}, ensure_ascii=False)))
+        handlers: Dict[str, Callable[[JsonDict], JsonDict]] = {
+            "robot_stop": lambda _: self.stop(),
+            "robot_move_forward": self.move_forward,
+            "robot_move_backward": self.move_backward,
+            "robot_turn_left": self.turn_left,
+            "robot_turn_right": self.turn_right,
+            "robot_raise_body": self.raise_body,
+            "robot_lower_body": self.lower_body,
+            "robot_pitch_up": self.pitch_up,
+            "robot_pitch_down": self.pitch_down,
+            "robot_roll_left": self.roll_left,
+            "robot_roll_right": self.roll_right,
+            "robot_reset_body_pose": lambda _: self.reset_body_pose(),
+            "robot_get_status": lambda _: self.get_status(),
+        }
+        if self.enable_posture_tools:
+            handlers["robot_stand_up"] = lambda _: self.stand(True)
+            handlers["robot_stand_down"] = lambda _: self.stand(False)
+
+        handler = handlers.get(name)
+        if handler is None:
+            raise ValueError("unknown tool: %s" % name)
+        return handler(arguments or {})
+
+    def move_forward(self, arguments: JsonDict) -> JsonDict:
+        speed = self._bounded_speed(arguments, "speed", self.default_linear_speed, self.max_linear_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(forward=speed, left=0.0, duration_ms=duration_ms)
+
+    def move_backward(self, arguments: JsonDict) -> JsonDict:
+        speed = self._bounded_speed(arguments, "speed", self.default_linear_speed, self.max_linear_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(forward=-speed, left=0.0, duration_ms=duration_ms)
+
+    def turn_left(self, arguments: JsonDict) -> JsonDict:
+        speed = self._bounded_speed(arguments, "speed", self.default_turn_speed, self.max_turn_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(forward=0.0, left=speed, duration_ms=duration_ms)
+
+    def turn_right(self, arguments: JsonDict) -> JsonDict:
+        speed = self._bounded_speed(arguments, "speed", self.default_turn_speed, self.max_turn_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(forward=0.0, left=-speed, duration_ms=duration_ms)
+
+    def raise_body(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_vertical_speed, self.max_vertical_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(up=value, duration_ms=duration_ms)
+
+    def lower_body(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_vertical_speed, self.max_vertical_speed)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(up=-value, duration_ms=duration_ms)
+
+    def pitch_up(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_pitch, self.max_pitch)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(pitch=value, duration_ms=duration_ms)
+
+    def pitch_down(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_pitch, self.max_pitch)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(pitch=-value, duration_ms=duration_ms)
+
+    def roll_left(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_roll, self.max_roll)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(roll=-value, duration_ms=duration_ms)
+
+    def roll_right(self, arguments: JsonDict) -> JsonDict:
+        value = self._bounded_value(arguments, self.default_roll, self.max_roll)
+        duration_ms = self._bounded_duration(arguments)
+        return self._move(roll=value, duration_ms=duration_ms)
+
+    def reset_body_pose(self) -> JsonDict:
+        self._publish_stop_repeated()
+        return {"ok": True, "action": "reset_body_pose"}
+
+    def stop(self) -> JsonDict:
+        self._publish_stop_repeated()
+        return {"ok": True, "action": "stop"}
+
+    def stand(self, stand_up: bool) -> JsonDict:
+        msg = MotionCtrl()
+        msg.mode_mark = True
+        msg.mode.stand_mode = bool(stand_up)
+        self._publish(msg)
+        time.sleep(max(0, self.action_reset_ms) / 1000.0)
+
+        if stand_up:
+            stand_up_height = _clamp(abs(self.stand_up_height), 0.0, self.max_vertical_speed)
+            publish_count = self._publish_motion_for(
+                up=stand_up_height,
+                duration_ms=max(0, self.stand_up_height_publish_ms),
+                description="stand up max height",
+            )
+            return {
+                "ok": True,
+                "action": "stand_up",
+                "up": round(stand_up_height, 3),
+                "height_publish_count": publish_count,
+            }
+
+        self.stop()
+        return {"ok": True, "action": "stand_down"}
+
+    def get_status(self) -> JsonDict:
+        now = time.time()
+        with self._lock:
+            status = self._latest_status
+            status_age = now - self._latest_status_time if status is not None else None
+            battery = self._latest_battery
+            battery_age = now - self._latest_battery_time if battery is not None else None
+
+        result: JsonDict = {"ok": True}
+        if status is None:
+            result["status"] = None
+        else:
+            result["status"] = {
+                "ctrl_mode": int(status.ctrl_mode_msg),
+                "robot_mode": int(status.robot_mode_msg),
+                "error": int(status.error_msg),
+                "warning": int(status.warning_msg),
+                "age_seconds": round(status_age or 0.0, 3),
+            }
+        if battery is None:
+            result["battery"] = None
+        else:
+            result["battery"] = {
+                "voltage": float(battery.voltage),
+                "current": float(battery.current),
+                "percentage": float(battery.percentage),
+                "age_seconds": round(battery_age or 0.0, 3),
+            }
+        return result
+
+    def _move(
+        self,
+        forward: float = 0.0,
+        left: float = 0.0,
+        up: Optional[float] = None,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        leg_split: float = 0.0,
+        duration_ms: Optional[int] = None,
+    ) -> JsonDict:
+        if duration_ms is None:
+            duration_ms = min(self.default_duration_ms, self.max_duration_ms)
+        motion_up = self.default_up if up is None else up
+        self._log(
+            "publish motion: forward=%.3f left=%.3f up=%.3f roll=%.3f pitch=%.3f duration_ms=%d"
+            % (forward, left, motion_up, roll, pitch, duration_ms)
+        )
+        period_s = max(0.02, self.command_period_ms / 1000.0)
+        self._wait_for_motion_subscriber()
+        deadline = time.monotonic() + (duration_ms / 1000.0)
+        publish_count = 0
+        try:
+            while True:
+                self._publish_motion(
+                    forward=forward,
+                    left=left,
+                    up=motion_up,
+                    roll=roll,
+                    pitch=pitch,
+                    leg_split=leg_split,
+                )
+                publish_count += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(period_s, remaining))
+        finally:
+            self._log("auto stop after motion after %d motion publishes" % publish_count)
+            self._publish_stop_repeated(period_s=period_s)
+        return {
+            "ok": True,
+            "action": "move",
+            "forward": round(forward, 3),
+            "left": round(left, 3),
+            "up": round(motion_up, 3),
+            "roll": round(roll, 3),
+            "pitch": round(pitch, 3),
+            "duration_ms": duration_ms,
+        }
+
+    def _publish_motion(
+        self,
+        forward: float,
+        left: float,
+        up: Optional[float] = None,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        leg_split: float = 0.0,
+        log: bool = True,
+    ) -> None:
+        motion_up = self.default_up if up is None else up
+        msg = MotionCtrl()
+        msg.mode_mark = False
+        msg.value.forward = float(forward)
+        msg.value.left = float(left)
+        msg.value.up = float(motion_up)
+        msg.value.roll = float(roll)
+        msg.value.pitch = float(pitch)
+        msg.value.leg_split = float(leg_split)
+        self._publish(msg)
+        if log:
+            self._log(
+                "published /%s forward=%.3f left=%.3f up=%.3f roll=%.3f pitch=%.3f"
+                % (self.motion_topic, forward, left, motion_up, roll, pitch)
+            )
+
+    def _publish_motion_for(
+        self,
+        forward: float = 0.0,
+        left: float = 0.0,
+        up: Optional[float] = None,
+        roll: float = 0.0,
+        pitch: float = 0.0,
+        leg_split: float = 0.0,
+        duration_ms: int = 0,
+        description: str = "hold motion",
+    ) -> int:
+        period_s = max(0.02, self.command_period_ms / 1000.0)
+        deadline = time.monotonic() + max(0, duration_ms) / 1000.0
+        publish_count = 0
+        while True:
+            self._publish_motion(
+                forward=forward,
+                left=left,
+                up=up,
+                roll=roll,
+                pitch=pitch,
+                leg_split=leg_split,
+                log=(publish_count == 0),
+            )
+            publish_count += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(period_s, remaining))
+        self._log("%s published %d motion commands" % (description, publish_count))
+        return publish_count
+
+    def _publish_stop_repeated(self, period_s: Optional[float] = None) -> None:
+        interval = period_s if period_s is not None else max(0.02, self.command_period_ms / 1000.0)
+        repeat_count = max(1, self.stop_repeat_count)
+        for index in range(repeat_count):
+            self._publish_motion(forward=0.0, left=0.0, log=False)
+            if index + 1 < repeat_count:
+                time.sleep(interval)
+        self._log("published stop x%d" % repeat_count)
+
+    def _publish(self, msg: MotionCtrl) -> None:
+        self._wait_for_motion_subscriber()
+        with self._lock:
+            self.publisher.publish(msg)
+
+    def _wait_for_motion_subscriber(self) -> None:
+        if self._motion_subscriber_seen or self.wait_for_subscriber_ms <= 0:
+            return
+
+        deadline = time.monotonic() + self.wait_for_subscriber_ms / 1000.0
+        while self.publisher.get_subscription_count() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        if self.publisher.get_subscription_count() > 0:
+            if self.discovery_settle_ms > 0:
+                time.sleep(self.discovery_settle_ms / 1000.0)
+            self._motion_subscriber_seen = True
+            self._log("motion subscriber detected on /%s" % self.motion_topic)
+        else:
+            self._log(
+                "publish without detected motion subscriber after %d ms"
+                % self.wait_for_subscriber_ms
+            )
+
+    def _status_callback(self, msg: RobotStatus) -> None:
+        with self._lock:
+            self._latest_status = msg
+            self._latest_status_time = time.time()
+
+    def _battery_callback(self, msg: BatteryState) -> None:
+        with self._lock:
+            self._latest_battery = msg
+            self._latest_battery_time = time.time()
+
+    def _bounded_speed(self, arguments: JsonDict, name: str, default: float, maximum: float) -> float:
+        speed = float(arguments.get(name, default))
+        return _clamp(abs(speed), 0.0, maximum)
+
+    def _bounded_value(self, arguments: JsonDict, default: float, maximum: float) -> float:
+        for name in ("value", "speed", "amount"):
+            if name in arguments:
+                return _clamp(abs(float(arguments[name])), 0.0, maximum)
+        return _clamp(abs(default), 0.0, maximum)
+
+    def _bounded_duration(self, arguments: JsonDict) -> int:
+        duration_ms = int(arguments.get("duration_ms", min(self.default_duration_ms, self.max_duration_ms)))
+        return int(_clamp(duration_ms, self.min_duration_ms, self.max_duration_ms))
+
+    def _speed_duration_schema(self, speed_description: str) -> JsonDict:
+        return {
+            "type": "object",
+            "properties": {
+                "speed": {
+                    "type": "number",
+                    "description": speed_description,
+                    "minimum": 0,
+                    "maximum": self.max_linear_speed,
+                    "default": min(self.default_linear_speed, self.max_linear_speed),
+                },
+                "duration_ms": {
+                    "type": "integer",
+                    "description": "Duration in milliseconds. The server always stops the robot afterwards.",
+                    "minimum": self.min_duration_ms,
+                    "maximum": self.max_duration_ms,
+                    "default": min(self.default_duration_ms, self.max_duration_ms),
+                },
+            },
+            "additionalProperties": False,
+        }
+
+    def _turn_duration_schema(self, speed_description: str) -> JsonDict:
+        schema = self._speed_duration_schema(speed_description)
+        schema["properties"]["speed"]["maximum"] = self.max_turn_speed
+        schema["properties"]["speed"]["default"] = min(self.default_turn_speed, self.max_turn_speed)
+        return schema
+
+    def _axis_duration_schema(self, value_description: str, default: float, maximum: float) -> JsonDict:
+        return {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "number",
+                    "description": value_description,
+                    "minimum": 0,
+                    "maximum": maximum,
+                    "default": min(default, maximum),
+                },
+                "duration_ms": {
+                    "type": "integer",
+                    "description": "Duration in milliseconds. The server always resets the command afterwards.",
+                    "minimum": self.min_duration_ms,
+                    "maximum": self.max_duration_ms,
+                    "default": min(self.default_duration_ms, self.max_duration_ms),
+                },
+            },
+            "additionalProperties": False,
+        }
+
+    def _empty_schema(self) -> JsonDict:
+        return {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
+
+    def _log(self, message: str) -> None:
+        print("[xiaozhi_robot_control] %s" % message, file=sys.stderr, flush=True)
+
+
+class JsonRpcMcpServer:
+    """Minimal JSON-RPC MCP server over newline-delimited stdio."""
+
+    def __init__(self, robot: DiabloRobotBridge) -> None:
+        self.robot = robot
+
+    def serve_forever(self) -> None:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+                response = self._handle_message(request)
+            except Exception as exc:
+                response = self._error(None, -32700, "parse or dispatch error: %s" % exc)
+            if response is not None:
+                self._write(response)
+
+    def _handle_message(self, request: JsonDict) -> Optional[JsonDict]:
+        if not isinstance(request, dict):
+            return self._error(None, -32600, "invalid JSON-RPC request")
+
+        request_id = request.get("id")
+        method = request.get("method")
+        params = request.get("params") or {}
+        is_notification = "id" not in request
+
+        if method == "initialize":
+            return self._result(
+                request_id,
+                {
+                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {
+                        "name": "diablo-robot-mcp",
+                        "version": "0.1.0",
+                    },
+                },
+            )
+        if method == "tools/list":
+            return self._result(request_id, {"tools": list(self.robot.tool_definitions())})
+        if method == "tools/call":
+            return self._handle_tool_call(request_id, params)
+        if method == "ping":
+            return self._result(request_id, {})
+        if method in ("resources/list", "prompts/list"):
+            key = "resources" if method == "resources/list" else "prompts"
+            return self._result(request_id, {key: []})
+        if isinstance(method, str) and method.startswith("notifications/"):
+            return None
+
+        if is_notification:
+            return None
+        return self._error(request_id, -32601, "method not found: %s" % method)
+
+    def _handle_tool_call(self, request_id: Any, params: JsonDict) -> JsonDict:
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        try:
+            result = self.robot.call_tool(str(name), arguments)
+            text = json.dumps(result, ensure_ascii=False)
+            return self._result(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": False,
+                },
+            )
+        except Exception as exc:
+            self.robot._log("tool error: %s" % exc)
+            return self._result(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": str(exc)}],
+                    "isError": True,
+                },
+            )
+
+    def _result(self, request_id: Any, result: JsonDict) -> JsonDict:
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+    def _error(self, request_id: Any, code: int, message: str) -> JsonDict:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
+
+    def _write(self, response: JsonDict) -> None:
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Diablo robot MCP stdio server")
+    parser.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="Print tool definitions as JSON and exit after initializing ROS.",
+    )
+    args = parser.parse_args()
+
+    robot = DiabloRobotBridge()
+    try:
+        if args.list_tools:
+            print(json.dumps({"tools": list(robot.tool_definitions())}, ensure_ascii=False, indent=2))
+            return
+        JsonRpcMcpServer(robot).serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        robot.shutdown()
+
+
+if __name__ == "__main__":
+    main()

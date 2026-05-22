@@ -24,14 +24,30 @@ uint8_t Telemetry::activate(void)
     header.data.LEN = sizeof(OSDK_Uart_Header_t) + 4 + OSDK_MISC_SIZE;
     header.data.SESSION = 2;
     header.data.ACK     = 1;
-    header.data.SEQ = vehicle->hal->serial_getSeq();
-    header.append_crc();
 
     uint32_t key = 0x12345678;
 
     uint16_t ack = -1;
-    vehicle->hal->serialSend_ack(header.data, ack, OSDK_INIT_SET, OSDK_ACTIVATION_ID, &key, 4);
+    uint8_t result = 0;
+    const int max_attempts = 3;
+    for(int attempt = 1; attempt <= max_attempts; attempt++)
+    {
+        ack = -1;
+        header.data.SEQ = vehicle->hal->serial_getSeq();
+        header.append_crc();
+        result = vehicle->hal->serialSend_ack(header.data, ack, OSDK_INIT_SET, OSDK_ACTIVATION_ID, &key, 4);
+        if(!result) break;
+        usleep(50000);
+    }
+    if(result)
+    {
+        std::cerr<<"Telemetry activation failed: serialSend_ack result="<<(int)result
+                 <<" ack="<<ack
+                 <<" attempts="<<max_attempts<<std::endl;
+        return result;
+    }
     this->id = ack;
+    std::cout<<"SDK activated with id "<<(int)this->id<<std::endl;
     cnt_thd = new std::thread(std::bind(&Telemetry::SDKConnectMonitor, this));
     return 0;
 }
@@ -162,14 +178,50 @@ uint8_t Telemetry::configUpdate(const bool save)
     Header header;
     header.data.LEN = sizeof(OSDK_Uart_Header_t) + 
         sizeof(OSDK_Set_Push_Data_Freq_t) + OSDK_MISC_SIZE;
-    header.data.SESSION = 1;
+    header.data.SESSION = 2;
     header.data.ACK     = 1;
-    header.data.SEQ = vehicle->hal->serial_getSeq();
-    header.append_crc();
 
-    vehicle->hal->serialSend(header.data, 
-        OSDK_INIT_SET, OSDK_SET_PUSH_DATA_FREQ_ID, 
-        (uint8_t*)&msg, sizeof(OSDK_Set_Push_Data_Freq_t));
+    uint16_t ack = -1;
+    uint8_t result = 0;
+    const int max_attempts = 5;
+    for(int attempt = 1; attempt <= max_attempts; attempt++)
+    {
+        ack = -1;
+        header.data.SEQ = vehicle->hal->serial_getSeq();
+        header.append_crc();
+        result = vehicle->hal->serialSend_ack(header.data,
+            ack,
+            OSDK_INIT_SET, OSDK_SET_PUSH_DATA_FREQ_ID,
+            (uint8_t*)&msg, sizeof(OSDK_Set_Push_Data_Freq_t));
+        if(!result) break;
+        usleep(50000);
+    }
+    if(result)
+    {
+        std::cerr<<"Telemetry config update failed: serialSend_ack result="<<(int)result
+                 <<" ack="<<ack
+                 <<" attempts="<<max_attempts
+                 <<" status="<<(int)msg.status
+                 <<" quaternion="<<(int)msg.quaternion
+                 <<" accl="<<(int)msg.accl
+                 <<" gyro="<<(int)msg.gyro
+                 <<" rc="<<(int)msg.RC
+                 <<" power="<<(int)msg.power
+                 <<" motor="<<(int)msg.motor
+                 <<std::endl;
+        memset(frequency_flag, OSDK_PUSH_DATA_NO_CHANGE, 7);
+        return result;
+    }
+
+    std::cout<<"Telemetry config update ack="<<ack
+             <<" status="<<(int)msg.status
+             <<" quaternion="<<(int)msg.quaternion
+             <<" accl="<<(int)msg.accl
+             <<" gyro="<<(int)msg.gyro
+             <<" rc="<<(int)msg.RC
+             <<" power="<<(int)msg.power
+             <<" motor="<<(int)msg.motor
+             <<std::endl;
 
     memset(frequency_flag, OSDK_PUSH_DATA_NO_CHANGE, 7);
 
@@ -211,33 +263,40 @@ uint8_t Telemetry::connection_check()
         sizeof(uint32_t) + OSDK_MISC_SIZE;
     header.data.SESSION = 2;
     header.data.ACK     = 1;
-    header.data.SEQ = vehicle->hal->serial_getSeq();
-    header.append_crc(); 
 
     uint32_t key = 0x87654321;
      
     uint16_t ack = -1;
-    uint8_t disconnect_cnt = 0;
     uint8_t result = 0;
-    while(ack != SDK_CONNECTED && disconnect_cnt < 10)
+    const int max_attempts = 3;
+    for(int attempt = 1; attempt <= max_attempts; attempt++)
     {
+        ack = -1;
+        header.data.SEQ = vehicle->hal->serial_getSeq();
+        header.append_crc();
         result = vehicle->hal->serialSend_ack(header.data, ack,
-        OSDK_INIT_SET, OSDK_CONNECTION_CHECK_ID,
-        &key, sizeof(uint32_t));
+            OSDK_INIT_SET, OSDK_CONNECTION_CHECK_ID,
+            &key, sizeof(uint32_t));
 
-        disconnect_cnt += 1;
-        usleep(5000);
-    }
-    if(disconnect_cnt > 10)
-    {
-        SerialDisconnectHandle();
-        if(cnt_thd)
+        if(!result && ack == SDK_CONNECTED)
         {
-            pthread_cancel(cnt_thd->native_handle());
+            return 0;
         }
-        result = 0xFF;
-        return result;
+        usleep(50000);
     }
+
+    if(!result)
+    {
+        std::cerr<<"OSDK connection check returned unexpected ack="<<ack
+                 <<" attempts="<<max_attempts
+                 <<"; serial is still responding, keeping control state."<<std::endl;
+        return 0;
+    }
+
+    std::cerr<<"OSDK connection check failed: result="<<(int)result
+             <<" ack="<<ack
+             <<" attempts="<<max_attempts<<std::endl;
+    SerialDisconnectHandle();
     return result;
 }
 
@@ -255,11 +314,12 @@ void Telemetry::SerialDisconnectHandle(void)
     memset(&this->status, 0, sizeof(OSDK_Push_Data_Status_t));
     vehicle->virtual_rc->SerialDisconnectHandle();
     vehicle->movement_ctrl->SerialDisconnectHandle();
-    std::cerr<<"OSDK Serial Receive Timeout Occured!"<<std::endl;
+    std::cerr<<"OSDK serial connection lost."<<std::endl;
 }
 
 void Telemetry::SerialHandle(void)
 {
+    uint32_t push_timeout_count = 0;
     while(true)
     {
         //printf("%u\n",newcome);
@@ -267,10 +327,15 @@ void Telemetry::SerialHandle(void)
         OSDK_Push_Data_Flag_t* flag = (OSDK_Push_Data_Flag_t*)(vehicle->hal->serialWaitRXDataS(lock, OSDK_DATA_SET, OSDK_PUSH_DATA_ID));
         if(flag == NULL)
         {
-            this->status.robot_mode = OSDK_ROBOT_STATE_DISCONNECT;
-            this->SerialDisconnectHandle();
+            push_timeout_count++;
+            if(push_timeout_count == 1 || push_timeout_count % 10 == 0)
+            {
+                std::cerr<<"OSDK telemetry push data timeout count="<<push_timeout_count
+                         <<"; keeping motion control state until connection check fails."<<std::endl;
+            }
             continue;
         }
+        push_timeout_count = 0;
 
         uint8_t* pData = (uint8_t*)flag + sizeof(OSDK_Push_Data_Flag_t);
         

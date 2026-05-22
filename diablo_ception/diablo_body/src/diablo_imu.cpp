@@ -11,7 +11,6 @@ void diablo_imu_publisher::imu_pub_init(void)
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_QUATERNION, OSDK_PUSH_DATA_50Hz);
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_ACCL, OSDK_PUSH_DATA_50Hz);
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_GYRO, OSDK_PUSH_DATA_50Hz);
-    this->vehicle->telemetry->configUpdate(); 
 }
 
 
@@ -87,4 +86,3 @@ diablo_imu_publisher::diablo_imu_publisher(rclcpp::Node::SharedPtr node_ptr,DIAB
     this->vehicle = vehicle;
 
 }
-

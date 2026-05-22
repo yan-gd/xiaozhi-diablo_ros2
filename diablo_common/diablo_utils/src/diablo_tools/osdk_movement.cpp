@@ -16,23 +16,32 @@ uint8_t Movement_Ctrl::obtain_control(uint16_t timeout_ms)
         sizeof(OSDK_Movement_Ctrl_Request_t) + OSDK_MISC_SIZE;
     header.data.SESSION = 2;
     header.data.ACK     = 1;
-    header.data.SEQ     = vehicle->hal->serial_getSeq();
-    header.append_crc();
-
     OSDK_Movement_Ctrl_Request_t req;
     req.request     = 1;
     req.timeout_act = 0;
     req.timeout_ms  = timeout_ms;
 
     uint16_t ack = -1;
-    while(ack != 0x0002)
+    uint8_t result = 0;
+    int attempts = 0;
+    const int max_attempts = 20;
+    while(ack != 0x0002 && attempts < max_attempts)
     {
+        attempts++;
+        ack = -1;
+        header.data.SEQ = vehicle->hal->serial_getSeq();
+        header.append_crc();
         // printf("Wait ack to get AUTHORIZE\n");
-        uint8_t result = vehicle->hal->serialSend_ack(header.data, ack, 
+        result = vehicle->hal->serialSend_ack(header.data, ack,
             OSDK_CONTROL_SET, OSDK_CTRL_AUTHORIZE_ID,
             &req, sizeof(OSDK_Movement_Ctrl_Request_t));
         
-        if(result) return result;
+        if(result)
+        {
+            printf("SDK movement control authorize failed: serialSend_ack result=%u ack=%u attempts=%d\n",
+                result, ack, attempts);
+            return result;
+        }
         if(ack == 0x0000)
         {
             // printf("ERROR: SDK control disable on manual movement_ctrl, check your robot.\n");
@@ -43,12 +52,24 @@ uint8_t Movement_Ctrl::obtain_control(uint16_t timeout_ms)
             // printf("ERROR: Cannot switch to SDK control, check your robot status.\n");
             return 3;
         }
+        if(ack == 0x0003)
+        {
+            printf("SDK movement control authorize returned ack=3, retrying for ack=2 attempts=%d\n",
+                attempts);
+        }
         usleep(5000);
+    }
+
+    if(ack != 0x0002)
+    {
+        printf("SDK movement control authorize timed out: last_ack=%u attempts=%d\n",
+            ack, attempts);
+        return 4;
     }
     
     this->ctrl_status = CTRL_OBTAINED;
     idle_buffer = true;
-    printf("SDK Handle Movement control\n");
+    printf("SDK Handle Movement control ack=%u\n", ack);
     //abort();
     return 0;
 }
@@ -85,7 +106,7 @@ void Movement_Ctrl::CtrlStatusMonitorHandle(const uint8_t ctrl_mode)
         ctrl_status = CTRL_OBTAINED;
         dropCtrlCnt = 0;
     }
-    else if(ctrl_mode & (1<<(4 + vehicle->telemetry->id*2)))        // another sdk handles control
+    else if(ctrl_mode & (1<<(4+vehicle->telemetry->id*2)))        // another sdk handles control
     {
         if(ctrl_mode & 0x0F)
             ctrl_status = CTRL_IDLE;
@@ -95,9 +116,15 @@ void Movement_Ctrl::CtrlStatusMonitorHandle(const uint8_t ctrl_mode)
     }
     else        //if(ctrl_mode != OSDK_CTRL_MODE_MOTION)
     {
+        if(ctrl_status != CTRL_OBTAINED)
+        {
+            dropCtrlCnt = 0;
+            return;
+        }
         if(dropCtrlCnt > 10)
         {
-            // printf("drop out is %d and ctrl mode is %d",(1<<(vehicle->telemetry->id*2)),ctrl_mode);
+            printf("movement control drop out: expected mask=%u ctrl_mode=%u sdk_id=%u\n",
+                (uint8_t)(1<<(vehicle->telemetry->id*2)), ctrl_mode, vehicle->telemetry->id);
             if(ctrl_status == CTRL_OBTAINED)
                 std::cout<<"Motion control authority released by vehicle"<<std::endl;
             this->SerialDisconnectHandle();
@@ -233,6 +260,7 @@ uint8_t Movement_Ctrl::SendTransformUpCmd()
         return 0;
     }
 
+    memset(&transform_data, 0, sizeof(OSDK_Transform_Cmd_t));
     transform_data.transform_down = 0;
     transform_data.transform_up = 1;
     Header header;
@@ -268,6 +296,7 @@ uint8_t Movement_Ctrl::SendTransformUpCmd()
 uint8_t Movement_Ctrl::SendJumpCmd(uint8_t Jump_mark)
 {
     
+    memset(&transform_data, 0, sizeof(OSDK_Transform_Cmd_t));
     transform_data.jump = Jump_mark;
     Header header;
     header.data.LEN = sizeof(OSDK_Uart_Header_t) + 
@@ -299,6 +328,7 @@ uint8_t Movement_Ctrl::SendJumpCmd(uint8_t Jump_mark)
 
 uint8_t Movement_Ctrl::SendDanceCmd(uint8_t dance_mark)
 {
+    memset(&transform_data, 0, sizeof(OSDK_Transform_Cmd_t));
     if(dance_mark){
         transform_data.automation = 2;
     }else{
@@ -345,6 +375,7 @@ uint8_t Movement_Ctrl::SendTransformDownCmd()
         return 0;
     }
 
+    memset(&transform_data, 0, sizeof(OSDK_Transform_Cmd_t));
     transform_data.transform_down = 1;
     transform_data.transform_up = 0;
     Header header;

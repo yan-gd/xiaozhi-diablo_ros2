@@ -2,6 +2,8 @@
 #include "diablo_utils/diablo_tools/osdk_hal.hpp"
 #include "diablo_utils/diablo_tools/osdk_header.hpp"
 
+#include <system_error>
+
 
 using namespace std;
 using namespace DIABLO::OSDK;
@@ -39,8 +41,8 @@ uint8_t HAL::serialSend_ack(const OSDK_Uart_Header_t& header, uint16_t& ack,
         return 1; //transmit timeout
     }
 
-    // should receive reporting ack value within 100ms, once the ack packet has been sent
-    static const chrono::duration<int, milli> timeout(100);
+    // The controller can be slow to answer while telemetry is being configured.
+    static const chrono::duration<int, milli> timeout(300);
     {
         unique_lock<mutex> lock(serial_rx_mtx);
         if(!serial_rx_ack_cond.wait_for(lock, timeout, 
@@ -49,6 +51,7 @@ uint8_t HAL::serialSend_ack(const OSDK_Uart_Header_t& header, uint16_t& ack,
             return 2;
         }
         ack = this->getACK();
+        *((uint8_t*)rx_data - 2) = *((uint8_t*)rx_data - 1) = -1;
     }
 
 
@@ -121,8 +124,18 @@ uint8_t HAL_Pi::serialSend(const OSDK_Uart_Header_t& header,
     serial_tx_idle = false;
     serial_tx_cond.notify_all();
 
-    for(uint8_t i = 0; i < size; i++) 
-        mySerial.WriteChar(serial_txbuf[i]);
+    try
+    {
+        for(uint8_t i = 0; i < size; i++)
+            mySerial.WriteChar(serial_txbuf[i]);
+    }
+    catch(const std::system_error& e)
+    {
+        serial_tx_idle = true;
+        serial_tx_cond.notify_all();
+        std::cerr<<"Serial write failed: "<<e.what()<<std::endl;
+        return 1;
+    }
     
     return 0;
 }
@@ -132,6 +145,7 @@ void HAL_Pi::RXMonitorProcess(void)
     Header header;
     uint8_t* p_header = (uint8_t*)(&header);
     uint32_t byte_micro = 1000000 * 10/serial_br;
+    uint32_t no_data_count = 0;
     while(true)
     {
         int start = -1;
@@ -139,8 +153,13 @@ void HAL_Pi::RXMonitorProcess(void)
         {
             start = mySerial.ReadChar();
             if(start == -1) //no data received at all
-                std::cerr<<"Serial receive timeout occured 1!"<<std::endl;
+            {
+                if(++no_data_count % 100 == 0)
+                    std::cerr<<"Serial receive timeout occured 1!"<<std::endl;
+                usleep(10000);
+            }
         }
+        no_data_count = 0;
         
         //wait for receiving a complete header
         usleep(byte_micro * sizeof(OSDK_Uart_Header_t));
@@ -208,4 +227,3 @@ void HAL_Pi::RXMonitorProcess(void)
         lock.unlock();
     }
 }
-

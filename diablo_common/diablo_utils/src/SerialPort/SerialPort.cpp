@@ -287,6 +287,7 @@ namespace VulcanSerial {
 					tty.c_ospeed = 230400;
 				    break;
 				case BaudRate::B_460800:
+					tty.c_cflag |= B460800;
 					tty.c_ispeed = 460800;
 					tty.c_ospeed = 460800;
 				    break;
@@ -511,4 +512,3 @@ namespace VulcanSerial {
     }
 
 } // namespace VulcanSerial
-

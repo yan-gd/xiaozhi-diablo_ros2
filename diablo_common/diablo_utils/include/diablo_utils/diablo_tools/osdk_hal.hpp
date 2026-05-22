@@ -154,6 +154,8 @@ public:
 
 protected:
     HAL():
+        serial_seq(0), serial_br(460800), rx_data(NULL), prebytes(0), first_rx_flag(false),
+        serial_tx_idle(true), serial_tx_duration(0),
         serial_tx_thd(NULL), serial_rx_thd(NULL),
         start_tp(std::chrono::system_clock::now()), VRC_Data_packet_num(0), VRC_REQ_packet_num(0)
         {}

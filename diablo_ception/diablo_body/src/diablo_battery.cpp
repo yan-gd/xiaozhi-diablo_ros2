@@ -8,7 +8,6 @@ void diablo_battery_publisher::battery_pub_init(void)
     battery_Publisher_ = this->node_ptr->create_publisher<sensor_msgs::msg::BatteryState>("diablo/sensor/Battery",10);
     timer_ = this->node_ptr->create_wall_timer(1s,std::bind(&diablo_battery_publisher::lazyBatteryPublisher, this));
     this->vehicle->telemetry->configTopic(DIABLO::OSDK::TOPIC_POWER, OSDK_PUSH_DATA_1Hz);
-    this->vehicle->telemetry->configUpdate(); 
 }
 
 void diablo_battery_publisher::lazyBatteryPublisher(void){

@@ -99,28 +99,19 @@ systemd-run --user --unit=diablo-ctrl-node --description=diablo-ctrl-node \
 
 ## 开机自启
 
-安装并启用用户 systemd 服务：
+安装并启用单一的用户 systemd 服务：
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
-./scripts/install_user_services.sh
+./scripts/install_simple_startup.sh
 ```
 
-这个脚本会安装并启用：
+本服务（`xiaozhi-diablo-startup`）默认会自动从 `~/.config/xiaozhi_robot_control/env` 或 `~/.bashrc` 中提取 `MCP_ENDPOINT` 接入点配置。
 
-- `diablo-ctrl-node.service`
-- `xiaozhi-mcp-bridge.service`
-
-首次安装会创建环境文件：
+如果还未配置，您可以直接将以下命令添加到 `~/.bashrc` 中，并使用 `systemctl --user restart xiaozhi-diablo-startup.service` 重启服务即可生效：
 
 ```bash
-~/.config/xiaozhi_robot_control/env
-```
-
-把里面的 `MCP_ENDPOINT` 改成小智后台复制的接入点后，再启动小智 bridge：
-
-```bash
-systemctl --user start xiaozhi-mcp-bridge.service
+export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
 ```
 
 如果需要未登录桌面也能开机启动用户服务，执行一次：
@@ -132,10 +123,8 @@ sudo loginctl enable-linger diablo
 查看状态和日志：
 
 ```bash
-systemctl --user status diablo-ctrl-node.service
-systemctl --user status xiaozhi-mcp-bridge.service
-journalctl --user -u diablo-ctrl-node.service -f
-journalctl --user -u xiaozhi-mcp-bridge.service -f
+systemctl --user status xiaozhi-diablo-startup.service
+journalctl --user -u xiaozhi-diablo-startup.service -f
 ```
 
 ## 本地测试 MCP 工具
@@ -168,8 +157,7 @@ cd ~/diablo_ws/src/xiaozhi_robot_control
 查看后台日志：
 
 ```bash
-journalctl --user -u diablo-ctrl-node.service -f
-journalctl --user -u xiaozhi-mcp-bridge.service -f
+journalctl --user -u xiaozhi-diablo-startup.service -f
 ```
 
 ## 推荐语音说法

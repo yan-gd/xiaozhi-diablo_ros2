@@ -1,7 +1,7 @@
 # Xiaozhi Robot Control
 
 这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
-本工程默认配置为 `robot1`，使用 `ROS_DOMAIN_ID=51`，并作为三机器人集群调度端。
+本工程默认配置为 `robot2`，使用 `ROS_DOMAIN_ID=52`，默认不作为集群调度端。
 如果多台机器人在同一个局域网内同时运行，每台机器人必须使用不同的 `ROS_DOMAIN_ID`，否则同一个 `diablo/MotionCmd` 命令会被同域内所有机器人接收。
 
 ## 架构
@@ -20,21 +20,21 @@ xiaozhi.me MCP 接入点
 
 ## 暴露给小智的工具
 
-默认 `DIABLO_ROBOT_NAME=robot1`，所以本机单独控制工具会暴露为：
+默认 `DIABLO_ROBOT_NAME=robot2`，所以本机单独控制工具会暴露为：
 
-- `robot1_stop`
-- `robot1_move_forward(speed, duration_ms)`
-- `robot1_move_backward(speed, duration_ms)`
-- `robot1_turn_left(speed, duration_ms)`
-- `robot1_turn_right(speed, duration_ms)`
-- `robot1_raise_body(value, duration_ms)`
-- `robot1_lower_body(value, duration_ms)`
-- `robot1_pitch_up(value, duration_ms)`
-- `robot1_pitch_down(value, duration_ms)`
-- `robot1_roll_left(value, duration_ms)`
-- `robot1_roll_right(value, duration_ms)`
-- `robot1_reset_body_pose`
-- `robot1_get_status`
+- `robot2_stop`
+- `robot2_move_forward(speed, duration_ms)`
+- `robot2_move_backward(speed, duration_ms)`
+- `robot2_turn_left(speed, duration_ms)`
+- `robot2_turn_right(speed, duration_ms)`
+- `robot2_raise_body(value, duration_ms)`
+- `robot2_lower_body(value, duration_ms)`
+- `robot2_pitch_up(value, duration_ms)`
+- `robot2_pitch_down(value, duration_ms)`
+- `robot2_roll_left(value, duration_ms)`
+- `robot2_roll_right(value, duration_ms)`
+- `robot2_reset_body_pose`
+- `robot2_get_status`
 
 只在一台调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具：
 
@@ -60,8 +60,8 @@ export DIABLO_ENABLE_POSTURE_TOOLS=0
 
 开启时会额外暴露：
 
-- `robot1_stand_up`
-- `robot1_stand_down`
+- `robot2_stand_up`
+- `robot2_stand_down`
 
 同时开启集群工具和站立/趴下动作时，会额外暴露：
 
@@ -122,12 +122,12 @@ export ROS_DOMAIN_ID=52
 export ROS_DOMAIN_ID=53
 ```
 
-本工程默认作为 `robot1` 和集群调度端使用；仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并只在 `robot1` 上开启集群工具：
+本工程默认作为 `robot2` 使用，不开启集群工具。仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并只在 `robot1` 上开启集群工具：
 
 ```bash
-export DIABLO_ROBOT_NAME=robot1
-export ROS_DOMAIN_ID=51
-export DIABLO_ENABLE_CLUSTER_TOOLS=true
+export DIABLO_ROBOT_NAME=robot2
+export ROS_DOMAIN_ID=52
+export DIABLO_ENABLE_CLUSTER_TOOLS=false
 export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
 export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
 ```
@@ -183,7 +183,7 @@ cd ~/diablo_ws/src/xiaozhi_robot_control
 ./scripts/local_mcp_smoke_test.py
 ```
 
-这个测试会初始化 MCP、列出工具，并默认调用一次 `robot1_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
+这个测试会初始化 MCP、列出工具，并默认调用一次 `robot2_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
 
 ## 连接 xiaozhi.me
 
@@ -196,7 +196,7 @@ export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
 本目录已经内置了一个轻量版 `scripts/xiaozhi_mcp_pipe.py`，不需要额外准备官方 `mcp_pipe.py`。
 
 ```bash
-export ROS_DOMAIN_ID=51
+export ROS_DOMAIN_ID=52
 cd ~/diablo_ws/src/xiaozhi_robot_control
 ./scripts/run_with_xiaozhi_endpoint.sh
 ```

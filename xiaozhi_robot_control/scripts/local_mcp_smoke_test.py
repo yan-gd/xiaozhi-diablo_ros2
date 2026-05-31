@@ -15,7 +15,7 @@ def request(proc, payload):
 
 
 def main():
-    robot_name = os.environ.get("DIABLO_ROBOT_NAME", "robot1")
+    robot_name = os.environ.get("DIABLO_ROBOT_NAME", "robot2")
     tool_name = sys.argv[1] if len(sys.argv) > 1 else "%s_stop" % robot_name
     tool_arguments = {}
     if len(sys.argv) > 2:

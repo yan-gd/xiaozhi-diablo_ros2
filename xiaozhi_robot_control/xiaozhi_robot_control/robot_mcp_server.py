@@ -9,11 +9,10 @@ of JSON-RPC methods needed by MCP clients such as xiaozhi mcp_pipe.
 import argparse
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import rclpy
 from motion_msgs.msg import MotionCtrl, RobotStatus
@@ -55,141 +54,8 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
-def _env_csv(name: str) -> List[str]:
-    value = os.environ.get(name, "")
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-class DomainMcpClient:
-    """Small JSON-RPC client for one child MCP server in a specific ROS domain."""
-
-    def __init__(self, domain_id: str, label: str) -> None:
-        self.domain_id = domain_id
-        self.label = label
-        self.process: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
-        self._request_id = 0
-
-    def call_tool(self, name: str, arguments: JsonDict) -> JsonDict:
-        with self._lock:
-            try:
-                return self._call_tool_locked(name, arguments)
-            except Exception:
-                self._stop_locked(send_stop=False)
-                return self._call_tool_locked(name, arguments)
-
-    def warm(self) -> None:
-        with self._lock:
-            self._ensure_started_locked()
-
-    def shutdown(self) -> None:
-        with self._lock:
-            self._stop_locked(send_stop=True)
-
-    def _call_tool_locked(self, name: str, arguments: JsonDict) -> JsonDict:
-        self._ensure_started_locked()
-        result = self._request_locked(
-            "tools/call",
-            {"name": name, "arguments": arguments or {}},
-        )
-        content = result.get("content") or []
-        text = content[0].get("text", "") if content else ""
-        try:
-            payload: Any = json.loads(text) if text else {}
-        except ValueError:
-            payload = text
-        return {
-            "ok": not bool(result.get("isError")),
-            "domain_id": self.domain_id,
-            "label": self.label,
-            "result": payload,
-        }
-
-    def _ensure_started_locked(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            return
-
-        env = os.environ.copy()
-        env["ROS_DOMAIN_ID"] = str(self.domain_id)
-        env["DIABLO_ENABLE_CLUSTER_TOOLS"] = "0"
-        env["DIABLO_MCP_NODE_NAME"] = "xiaozhi_cluster_mcp_%s" % self._safe_label()
-
-        command = [sys.executable, os.path.abspath(__file__)]
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            env=env,
-        )
-        threading.Thread(target=self._stderr_loop, daemon=True).start()
-        self._request_locked("initialize", {})
-
-    def _request_locked(self, method: str, params: JsonDict) -> JsonDict:
-        if self.process is None or self.process.stdin is None or self.process.stdout is None:
-            raise RuntimeError("child MCP process is not running")
-        if self.process.poll() is not None:
-            raise RuntimeError("child MCP process exited with code %s" % self.process.returncode)
-
-        self._request_id += 1
-        request_id = self._request_id
-        self.process.stdin.write(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        self.process.stdin.flush()
-
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError("child MCP process closed stdout")
-        response = json.loads(line)
-        if "error" in response:
-            raise RuntimeError(response["error"].get("message", "child MCP request failed"))
-        return response.get("result") or {}
-
-    def _stop_locked(self, send_stop: bool) -> None:
-        if self.process is None:
-            return
-        try:
-            if send_stop and self.process.poll() is None:
-                try:
-                    self._request_locked("tools/call", {"name": "robot_stop", "arguments": {}})
-                except Exception:
-                    pass
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-        finally:
-            self.process = None
-
-    def _stderr_loop(self) -> None:
-        if self.process is None or self.process.stderr is None:
-            return
-        for line in self.process.stderr:
-            sys.stderr.write("[cluster:%s] %s" % (self.label, line))
-            sys.stderr.flush()
-
-    def _safe_label(self) -> str:
-        return "".join(ch if ch.isalnum() else "_" for ch in self.label) or self.domain_id
-
-
-class ClusterToolDispatcher:
-    """Fan out cluster tool calls to multiple per-domain child MCP servers."""
+class ClusterToolAliases:
+    """Expose same-name cluster tools that execute on this robot only."""
 
     TOOL_MAP = {
         "robot_cluster_stop": "robot_stop",
@@ -209,75 +75,45 @@ class ClusterToolDispatcher:
         "robot_cluster_stand_down": "robot_stand_down",
     }
 
-    def __init__(self, robot: "DiabloRobotBridge", domains: List[str], labels: List[str]) -> None:
+    def __init__(self, robot: "DiabloRobotBridge") -> None:
         self.robot = robot
-        self.clients = [
-            DomainMcpClient(domain_id, labels[index] if index < len(labels) else "robot%d" % (index + 1))
-            for index, domain_id in enumerate(domains)
-        ]
 
     @classmethod
-    def from_env(cls, robot: "DiabloRobotBridge") -> Optional["ClusterToolDispatcher"]:
+    def from_env(cls, robot: "DiabloRobotBridge") -> Optional["ClusterToolAliases"]:
         if not _env_bool("DIABLO_ENABLE_CLUSTER_TOOLS", False):
             return None
-        domains = _env_csv("DIABLO_CLUSTER_ROS_DOMAIN_IDS")
-        if not domains:
-            domains = [os.environ.get("ROS_DOMAIN_ID", "5")]
-        labels = _env_csv("DIABLO_CLUSTER_ROBOT_NAMES")
-        dispatcher = cls(robot, domains, labels)
-        if _env_bool("DIABLO_CLUSTER_PRESTART", True):
-            dispatcher.prestart()
-        return dispatcher
-
-    def prestart(self) -> None:
-        errors: Dict[str, str] = {}
-        lock = threading.Lock()
-
-        def worker(client: DomainMcpClient) -> None:
-            try:
-                client.warm()
-            except Exception as exc:
-                with lock:
-                    errors[client.label] = str(exc)
-
-        threads = [threading.Thread(target=worker, args=(client,)) for client in self.clients]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        if errors:
-            self.robot._log("cluster prestart warnings: %s" % json.dumps(errors, ensure_ascii=False))
+        return cls(robot)
 
     def tool_definitions(self) -> Iterable[JsonDict]:
         tools = [
             {
                 "name": "robot_cluster_stop",
-                "description": "Stop all configured robots immediately.",
+                "description": "Stop this robot as its local part of a cluster command.",
                 "inputSchema": self.robot._empty_schema(),
             },
             {
                 "name": "robot_cluster_move_forward",
-                "description": "Move all configured robots forward for a bounded duration, then stop automatically.",
+                "description": "Move this robot forward as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._speed_duration_schema("Forward speed in meters per second."),
             },
             {
                 "name": "robot_cluster_move_backward",
-                "description": "Move all configured robots backward for a bounded duration, then stop automatically.",
+                "description": "Move this robot backward as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._speed_duration_schema("Backward speed in meters per second."),
             },
             {
                 "name": "robot_cluster_turn_left",
-                "description": "Turn all configured robots left for a bounded duration, then stop automatically.",
+                "description": "Turn this robot left as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._turn_duration_schema("Left turn angular speed in radians per second."),
             },
             {
                 "name": "robot_cluster_turn_right",
-                "description": "Turn all configured robots right for a bounded duration, then stop automatically.",
+                "description": "Turn this robot right as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._turn_duration_schema("Right turn angular speed in radians per second."),
             },
             {
                 "name": "robot_cluster_raise_body",
-                "description": "Raise all configured robot bodies briefly, then stop automatically.",
+                "description": "Raise this robot body as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
                     "Positive vertical command value.",
                     self.robot.default_vertical_speed,
@@ -286,16 +122,16 @@ class ClusterToolDispatcher:
             },
             {
                 "name": "robot_cluster_lower_body",
-                "description": "Lower all configured robot bodies briefly, then stop automatically.",
+                "description": "Lower this robot body as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
-                    "Positive vertical command value. Each robot receives it as a negative up command.",
+                    "Positive vertical command value. This robot receives it as a negative up command.",
                     self.robot.default_vertical_speed,
                     self.robot.max_vertical_speed,
                 ),
             },
             {
                 "name": "robot_cluster_pitch_up",
-                "description": "Tilt all configured robot bodies pitch upward briefly, then stop automatically.",
+                "description": "Tilt this robot body pitch upward as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
                     "Positive pitch command value.",
                     self.robot.default_pitch,
@@ -304,25 +140,25 @@ class ClusterToolDispatcher:
             },
             {
                 "name": "robot_cluster_pitch_down",
-                "description": "Tilt all configured robot bodies pitch downward briefly, then stop automatically.",
+                "description": "Tilt this robot body pitch downward as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
-                    "Positive pitch command value. Each robot receives it as a negative pitch command.",
+                    "Positive pitch command value. This robot receives it as a negative pitch command.",
                     self.robot.default_pitch,
                     self.robot.max_pitch,
                 ),
             },
             {
                 "name": "robot_cluster_roll_left",
-                "description": "Lean all configured robot bodies left briefly, then stop automatically.",
+                "description": "Lean this robot body left as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
-                    "Positive roll command value. Each robot receives it as a negative roll command.",
+                    "Positive roll command value. This robot receives it as a negative roll command.",
                     self.robot.default_roll,
                     self.robot.max_roll,
                 ),
             },
             {
                 "name": "robot_cluster_roll_right",
-                "description": "Lean all configured robot bodies right briefly, then stop automatically.",
+                "description": "Lean this robot body right as its local part of a cluster command, then stop automatically.",
                 "inputSchema": self.robot._axis_duration_schema(
                     "Positive roll command value.",
                     self.robot.default_roll,
@@ -331,12 +167,12 @@ class ClusterToolDispatcher:
             },
             {
                 "name": "robot_cluster_reset_body_pose",
-                "description": "Reset motion and body pose commands on all configured robots.",
+                "description": "Reset this robot motion and body pose commands as its local part of a cluster command.",
                 "inputSchema": self.robot._empty_schema(),
             },
             {
                 "name": "robot_cluster_get_status",
-                "description": "Read latest status and battery data from all configured robots.",
+                "description": "Read this robot status and battery data as its local part of a cluster command.",
                 "inputSchema": self.robot._empty_schema(),
             },
         ]
@@ -345,12 +181,12 @@ class ClusterToolDispatcher:
                 [
                     {
                         "name": "robot_cluster_stand_up",
-                        "description": "Send stand-up command to all configured robots.",
+                        "description": "Send stand-up command to this robot as its local part of a cluster command.",
                         "inputSchema": self.robot._empty_schema(),
                     },
                     {
                         "name": "robot_cluster_stand_down",
-                        "description": "Send stand-down command to all configured robots.",
+                        "description": "Send stand-down command to this robot as its local part of a cluster command.",
                         "inputSchema": self.robot._empty_schema(),
                     },
                 ]
@@ -367,38 +203,18 @@ class ClusterToolDispatcher:
         if target_tool is None or not self.can_handle(name):
             raise ValueError("unknown cluster tool: %s" % name)
 
-        results: Dict[str, JsonDict] = {}
-        errors: Dict[str, str] = {}
-        lock = threading.Lock()
-
-        def worker(client: DomainMcpClient) -> None:
-            try:
-                result = client.call_tool(target_tool, arguments)
-                with lock:
-                    results[client.label] = result
-            except Exception as exc:
-                with lock:
-                    errors[client.label] = str(exc)
-
-        threads = [threading.Thread(target=worker, args=(client,)) for client in self.clients]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        ok = not errors and all(result.get("ok", False) for result in results.values())
+        result = self.robot._call_canonical_tool(target_tool, arguments or {})
         return {
-            "ok": ok,
+            "ok": bool(result.get("ok", True)) if isinstance(result, dict) else True,
             "action": name,
             "target_tool": target_tool,
-            "robot_count": len(self.clients),
-            "results": results,
-            "errors": errors,
+            "robot_name": self.robot.robot_name,
+            "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+            "result": result,
         }
 
     def shutdown(self) -> None:
-        for client in self.clients:
-            client.shutdown()
+        return None
 
 
 class DiabloRobotBridge:
@@ -453,9 +269,9 @@ class DiabloRobotBridge:
 
         self._spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         self._spin_thread.start()
-        self.cluster_tools = ClusterToolDispatcher.from_env(self)
+        self.cluster_tools = ClusterToolAliases.from_env(self)
         self._log(
-            "robot MCP bridge ready: node=%s robot_name=%s tool_prefix=%s motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s cluster_domains=%s"
+            "robot MCP bridge ready: node=%s robot_name=%s tool_prefix=%s motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s cluster_tools=%s"
             % (
                 node_name,
                 self.robot_name,
@@ -474,9 +290,7 @@ class DiabloRobotBridge:
                 os.environ.get("ROS_DOMAIN_ID", ""),
                 os.environ.get("RMW_IMPLEMENTATION", ""),
                 os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", ""),
-                ",".join(client.domain_id for client in self.cluster_tools.clients)
-                if self.cluster_tools is not None
-                else "",
+                "enabled" if self.cluster_tools is not None else "disabled",
             )
         )
 
@@ -620,6 +434,9 @@ class DiabloRobotBridge:
             return self.cluster_tools.call_tool(name, arguments or {})
 
         name = self._canonical_tool_name(name)
+        return self._call_canonical_tool(name, arguments or {})
+
+    def _call_canonical_tool(self, name: str, arguments: JsonDict) -> JsonDict:
         handlers: Dict[str, Callable[[JsonDict], JsonDict]] = {
             "robot_stop": lambda _: self.stop(),
             "robot_move_forward": self.move_forward,

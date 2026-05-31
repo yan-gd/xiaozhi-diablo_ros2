@@ -10,9 +10,13 @@ if [ -f "${DIABLO_WS}/install/setup.bash" ]; then
   source "${DIABLO_WS}/install/setup.bash"
 fi
 
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-5}"
+export DIABLO_ROBOT_NAME="${DIABLO_ROBOT_NAME:-robot1}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-51}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${PKG_ROOT}/config/fastdds_udp_only.xml}"
 export PYTHONPATH="${PKG_ROOT}:${PYTHONPATH:-}"
 export DIABLO_ENABLE_POSTURE_TOOLS="${DIABLO_ENABLE_POSTURE_TOOLS:-true}"
+export DIABLO_ENABLE_CLUSTER_TOOLS="${DIABLO_ENABLE_CLUSTER_TOOLS:-true}"
+export DIABLO_CLUSTER_ROS_DOMAIN_IDS="${DIABLO_CLUSTER_ROS_DOMAIN_IDS:-51,52,53}"
+export DIABLO_CLUSTER_ROBOT_NAMES="${DIABLO_CLUSTER_ROBOT_NAMES:-robot1,robot2,robot3}"
 exec python3 "${PKG_ROOT}/xiaozhi_robot_control/robot_mcp_server.py"

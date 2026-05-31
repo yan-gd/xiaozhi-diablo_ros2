@@ -60,7 +60,11 @@ source_if_present "${HOME}/.profile"
 load_env_file "${HOME}/.config/xiaozhi_robot_control/env"
 load_mcp_endpoint_assignment "${HOME}/.bashrc"
 
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-5}"
+export DIABLO_ROBOT_NAME="${DIABLO_ROBOT_NAME:-robot1}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-51}"
+export DIABLO_ENABLE_CLUSTER_TOOLS="${DIABLO_ENABLE_CLUSTER_TOOLS:-true}"
+export DIABLO_CLUSTER_ROS_DOMAIN_IDS="${DIABLO_CLUSTER_ROS_DOMAIN_IDS:-51,52,53}"
+export DIABLO_CLUSTER_ROBOT_NAMES="${DIABLO_CLUSTER_ROBOT_NAMES:-robot1,robot2,robot3}"
 
 if [ -z "${MCP_ENDPOINT:-}" ]; then
   echo "MCP_ENDPOINT is not set. Set it in /etc/environment or ~/.config/xiaozhi_robot_control/env." >&2
@@ -73,7 +77,6 @@ CTRL_PID=$!
 
 sleep "${DIABLO_CTRL_START_DELAY_SEC:-5}"
 
-export ROS_DOMAIN_ID=5
 cd "${PKG_ROOT}"
 ./scripts/run_with_xiaozhi_endpoint.sh &
 BRIDGE_PID=$!

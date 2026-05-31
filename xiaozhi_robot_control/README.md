@@ -1,7 +1,8 @@
 # Xiaozhi Robot Control
 
 这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
-它默认使用 `ROS_DOMAIN_ID=5`，要和机器人上的控制节点保持一致。
+本工程默认配置为 `robot1`，使用 `ROS_DOMAIN_ID=51`，并作为三机器人集群调度端。
+如果多台机器人在同一个局域网内同时运行，每台机器人必须使用不同的 `ROS_DOMAIN_ID`，否则同一个 `diablo/MotionCmd` 命令会被同域内所有机器人接收。
 
 ## 架构
 
@@ -19,19 +20,37 @@ xiaozhi.me MCP 接入点
 
 ## 暴露给小智的工具
 
-- `robot_stop`
-- `robot_move_forward(speed, duration_ms)`
-- `robot_move_backward(speed, duration_ms)`
-- `robot_turn_left(speed, duration_ms)`
-- `robot_turn_right(speed, duration_ms)`
-- `robot_raise_body(value, duration_ms)`
-- `robot_lower_body(value, duration_ms)`
-- `robot_pitch_up(value, duration_ms)`
-- `robot_pitch_down(value, duration_ms)`
-- `robot_roll_left(value, duration_ms)`
-- `robot_roll_right(value, duration_ms)`
-- `robot_reset_body_pose`
-- `robot_get_status`
+默认 `DIABLO_ROBOT_NAME=robot1`，所以本机单独控制工具会暴露为：
+
+- `robot1_stop`
+- `robot1_move_forward(speed, duration_ms)`
+- `robot1_move_backward(speed, duration_ms)`
+- `robot1_turn_left(speed, duration_ms)`
+- `robot1_turn_right(speed, duration_ms)`
+- `robot1_raise_body(value, duration_ms)`
+- `robot1_lower_body(value, duration_ms)`
+- `robot1_pitch_up(value, duration_ms)`
+- `robot1_pitch_down(value, duration_ms)`
+- `robot1_roll_left(value, duration_ms)`
+- `robot1_roll_right(value, duration_ms)`
+- `robot1_reset_body_pose`
+- `robot1_get_status`
+
+只在一台调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具：
+
+- `robot_cluster_stop`
+- `robot_cluster_move_forward(speed, duration_ms)`
+- `robot_cluster_move_backward(speed, duration_ms)`
+- `robot_cluster_turn_left(speed, duration_ms)`
+- `robot_cluster_turn_right(speed, duration_ms)`
+- `robot_cluster_raise_body(value, duration_ms)`
+- `robot_cluster_lower_body(value, duration_ms)`
+- `robot_cluster_pitch_up(value, duration_ms)`
+- `robot_cluster_pitch_down(value, duration_ms)`
+- `robot_cluster_roll_left(value, duration_ms)`
+- `robot_cluster_roll_right(value, duration_ms)`
+- `robot_cluster_reset_body_pose`
+- `robot_cluster_get_status`
 
 `scripts/run_robot_mcp_stdio.sh` 默认暴露站立/趴下动作。需要关闭时设置：
 
@@ -41,8 +60,13 @@ export DIABLO_ENABLE_POSTURE_TOOLS=0
 
 开启时会额外暴露：
 
-- `robot_stand_up`
-- `robot_stand_down`
+- `robot1_stand_up`
+- `robot1_stand_down`
+
+同时开启集群工具和站立/趴下动作时，会额外暴露：
+
+- `robot_cluster_stand_up`
+- `robot_cluster_stand_down`
 
 暂不默认暴露跳跃、分腿舞蹈、控制模式切换等更激烈或更容易误触发的手柄动作。
 
@@ -83,7 +107,32 @@ source install/setup.bash
 
 ## 启动机器人控制节点
 
-`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会设置 `ROS_DOMAIN_ID=5`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
+`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会使用当前环境里的 `ROS_DOMAIN_ID`，未设置时默认为 `5`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
+
+多机器人同网部署时，请给每台机器人配置不同的 `ROS_DOMAIN_ID`，并确保同一台机器人上的 `diablo_ctrl_node` 和 MCP 桥接服务使用相同的值。例如：
+
+```bash
+# 机器人1
+export ROS_DOMAIN_ID=51
+
+# 机器人2
+export ROS_DOMAIN_ID=52
+
+# 机器人3
+export ROS_DOMAIN_ID=53
+```
+
+本工程默认作为 `robot1` 和集群调度端使用；仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并只在 `robot1` 上开启集群工具：
+
+```bash
+export DIABLO_ROBOT_NAME=robot1
+export ROS_DOMAIN_ID=51
+export DIABLO_ENABLE_CLUSTER_TOOLS=true
+export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
+export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
+```
+
+`robot1` 会为每个 `ROS_DOMAIN_ID` 启动一个轻量子 MCP 发布器；小智调用 `robot_cluster_*` 工具时，`robot1` 会并行向三台机器人所在的 ROS domain 发布同一条命令。不要在三台机器人上同时开启 `DIABLO_ENABLE_CLUSTER_TOOLS`，否则小智后台会看到多套重复的集群工具。
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
@@ -134,7 +183,7 @@ cd ~/diablo_ws/src/xiaozhi_robot_control
 ./scripts/local_mcp_smoke_test.py
 ```
 
-这个测试会初始化 MCP、列出工具，并调用一次 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
+这个测试会初始化 MCP、列出工具，并默认调用一次 `robot1_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
 
 ## 连接 xiaozhi.me
 
@@ -147,7 +196,7 @@ export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
 本目录已经内置了一个轻量版 `scripts/xiaozhi_mcp_pipe.py`，不需要额外准备官方 `mcp_pipe.py`。
 
 ```bash
-export ROS_DOMAIN_ID=5
+export ROS_DOMAIN_ID=51
 cd ~/diablo_ws/src/xiaozhi_robot_control
 ./scripts/run_with_xiaozhi_endpoint.sh
 ```

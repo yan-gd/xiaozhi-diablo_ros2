@@ -9,10 +9,11 @@ of JSON-RPC methods needed by MCP clients such as xiaozhi mcp_pipe.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import rclpy
 from motion_msgs.msg import MotionCtrl, RobotStatus
@@ -54,6 +55,352 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def _env_csv(name: str) -> List[str]:
+    value = os.environ.get(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+class DomainMcpClient:
+    """Small JSON-RPC client for one child MCP server in a specific ROS domain."""
+
+    def __init__(self, domain_id: str, label: str) -> None:
+        self.domain_id = domain_id
+        self.label = label
+        self.process: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self._request_id = 0
+
+    def call_tool(self, name: str, arguments: JsonDict) -> JsonDict:
+        with self._lock:
+            try:
+                return self._call_tool_locked(name, arguments)
+            except Exception:
+                self._stop_locked(send_stop=False)
+                return self._call_tool_locked(name, arguments)
+
+    def warm(self) -> None:
+        with self._lock:
+            self._ensure_started_locked()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._stop_locked(send_stop=True)
+
+    def _call_tool_locked(self, name: str, arguments: JsonDict) -> JsonDict:
+        self._ensure_started_locked()
+        result = self._request_locked(
+            "tools/call",
+            {"name": name, "arguments": arguments or {}},
+        )
+        content = result.get("content") or []
+        text = content[0].get("text", "") if content else ""
+        try:
+            payload: Any = json.loads(text) if text else {}
+        except ValueError:
+            payload = text
+        return {
+            "ok": not bool(result.get("isError")),
+            "domain_id": self.domain_id,
+            "label": self.label,
+            "result": payload,
+        }
+
+    def _ensure_started_locked(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+
+        env = os.environ.copy()
+        env["ROS_DOMAIN_ID"] = str(self.domain_id)
+        env["DIABLO_ENABLE_CLUSTER_TOOLS"] = "0"
+        env["DIABLO_MCP_NODE_NAME"] = "xiaozhi_cluster_mcp_%s" % self._safe_label()
+
+        command = [sys.executable, os.path.abspath(__file__)]
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            env=env,
+        )
+        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        self._request_locked("initialize", {})
+
+    def _request_locked(self, method: str, params: JsonDict) -> JsonDict:
+        if self.process is None or self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("child MCP process is not running")
+        if self.process.poll() is not None:
+            raise RuntimeError("child MCP process exited with code %s" % self.process.returncode)
+
+        self._request_id += 1
+        request_id = self._request_id
+        self.process.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        self.process.stdin.flush()
+
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError("child MCP process closed stdout")
+        response = json.loads(line)
+        if "error" in response:
+            raise RuntimeError(response["error"].get("message", "child MCP request failed"))
+        return response.get("result") or {}
+
+    def _stop_locked(self, send_stop: bool) -> None:
+        if self.process is None:
+            return
+        try:
+            if send_stop and self.process.poll() is None:
+                try:
+                    self._request_locked("tools/call", {"name": "robot_stop", "arguments": {}})
+                except Exception:
+                    pass
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+        finally:
+            self.process = None
+
+    def _stderr_loop(self) -> None:
+        if self.process is None or self.process.stderr is None:
+            return
+        for line in self.process.stderr:
+            sys.stderr.write("[cluster:%s] %s" % (self.label, line))
+            sys.stderr.flush()
+
+    def _safe_label(self) -> str:
+        return "".join(ch if ch.isalnum() else "_" for ch in self.label) or self.domain_id
+
+
+class ClusterToolDispatcher:
+    """Fan out cluster tool calls to multiple per-domain child MCP servers."""
+
+    TOOL_MAP = {
+        "robot_cluster_stop": "robot_stop",
+        "robot_cluster_move_forward": "robot_move_forward",
+        "robot_cluster_move_backward": "robot_move_backward",
+        "robot_cluster_turn_left": "robot_turn_left",
+        "robot_cluster_turn_right": "robot_turn_right",
+        "robot_cluster_raise_body": "robot_raise_body",
+        "robot_cluster_lower_body": "robot_lower_body",
+        "robot_cluster_pitch_up": "robot_pitch_up",
+        "robot_cluster_pitch_down": "robot_pitch_down",
+        "robot_cluster_roll_left": "robot_roll_left",
+        "robot_cluster_roll_right": "robot_roll_right",
+        "robot_cluster_reset_body_pose": "robot_reset_body_pose",
+        "robot_cluster_get_status": "robot_get_status",
+        "robot_cluster_stand_up": "robot_stand_up",
+        "robot_cluster_stand_down": "robot_stand_down",
+    }
+
+    def __init__(self, robot: "DiabloRobotBridge", domains: List[str], labels: List[str]) -> None:
+        self.robot = robot
+        self.clients = [
+            DomainMcpClient(domain_id, labels[index] if index < len(labels) else "robot%d" % (index + 1))
+            for index, domain_id in enumerate(domains)
+        ]
+
+    @classmethod
+    def from_env(cls, robot: "DiabloRobotBridge") -> Optional["ClusterToolDispatcher"]:
+        if not _env_bool("DIABLO_ENABLE_CLUSTER_TOOLS", False):
+            return None
+        domains = _env_csv("DIABLO_CLUSTER_ROS_DOMAIN_IDS")
+        if not domains:
+            domains = [os.environ.get("ROS_DOMAIN_ID", "5")]
+        labels = _env_csv("DIABLO_CLUSTER_ROBOT_NAMES")
+        dispatcher = cls(robot, domains, labels)
+        if _env_bool("DIABLO_CLUSTER_PRESTART", True):
+            dispatcher.prestart()
+        return dispatcher
+
+    def prestart(self) -> None:
+        errors: Dict[str, str] = {}
+        lock = threading.Lock()
+
+        def worker(client: DomainMcpClient) -> None:
+            try:
+                client.warm()
+            except Exception as exc:
+                with lock:
+                    errors[client.label] = str(exc)
+
+        threads = [threading.Thread(target=worker, args=(client,)) for client in self.clients]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            self.robot._log("cluster prestart warnings: %s" % json.dumps(errors, ensure_ascii=False))
+
+    def tool_definitions(self) -> Iterable[JsonDict]:
+        tools = [
+            {
+                "name": "robot_cluster_stop",
+                "description": "Stop all configured robots immediately.",
+                "inputSchema": self.robot._empty_schema(),
+            },
+            {
+                "name": "robot_cluster_move_forward",
+                "description": "Move all configured robots forward for a bounded duration, then stop automatically.",
+                "inputSchema": self.robot._speed_duration_schema("Forward speed in meters per second."),
+            },
+            {
+                "name": "robot_cluster_move_backward",
+                "description": "Move all configured robots backward for a bounded duration, then stop automatically.",
+                "inputSchema": self.robot._speed_duration_schema("Backward speed in meters per second."),
+            },
+            {
+                "name": "robot_cluster_turn_left",
+                "description": "Turn all configured robots left for a bounded duration, then stop automatically.",
+                "inputSchema": self.robot._turn_duration_schema("Left turn angular speed in radians per second."),
+            },
+            {
+                "name": "robot_cluster_turn_right",
+                "description": "Turn all configured robots right for a bounded duration, then stop automatically.",
+                "inputSchema": self.robot._turn_duration_schema("Right turn angular speed in radians per second."),
+            },
+            {
+                "name": "robot_cluster_raise_body",
+                "description": "Raise all configured robot bodies briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive vertical command value.",
+                    self.robot.default_vertical_speed,
+                    self.robot.max_vertical_speed,
+                ),
+            },
+            {
+                "name": "robot_cluster_lower_body",
+                "description": "Lower all configured robot bodies briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive vertical command value. Each robot receives it as a negative up command.",
+                    self.robot.default_vertical_speed,
+                    self.robot.max_vertical_speed,
+                ),
+            },
+            {
+                "name": "robot_cluster_pitch_up",
+                "description": "Tilt all configured robot bodies pitch upward briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive pitch command value.",
+                    self.robot.default_pitch,
+                    self.robot.max_pitch,
+                ),
+            },
+            {
+                "name": "robot_cluster_pitch_down",
+                "description": "Tilt all configured robot bodies pitch downward briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive pitch command value. Each robot receives it as a negative pitch command.",
+                    self.robot.default_pitch,
+                    self.robot.max_pitch,
+                ),
+            },
+            {
+                "name": "robot_cluster_roll_left",
+                "description": "Lean all configured robot bodies left briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive roll command value. Each robot receives it as a negative roll command.",
+                    self.robot.default_roll,
+                    self.robot.max_roll,
+                ),
+            },
+            {
+                "name": "robot_cluster_roll_right",
+                "description": "Lean all configured robot bodies right briefly, then stop automatically.",
+                "inputSchema": self.robot._axis_duration_schema(
+                    "Positive roll command value.",
+                    self.robot.default_roll,
+                    self.robot.max_roll,
+                ),
+            },
+            {
+                "name": "robot_cluster_reset_body_pose",
+                "description": "Reset motion and body pose commands on all configured robots.",
+                "inputSchema": self.robot._empty_schema(),
+            },
+            {
+                "name": "robot_cluster_get_status",
+                "description": "Read latest status and battery data from all configured robots.",
+                "inputSchema": self.robot._empty_schema(),
+            },
+        ]
+        if self.robot.enable_posture_tools:
+            tools.extend(
+                [
+                    {
+                        "name": "robot_cluster_stand_up",
+                        "description": "Send stand-up command to all configured robots.",
+                        "inputSchema": self.robot._empty_schema(),
+                    },
+                    {
+                        "name": "robot_cluster_stand_down",
+                        "description": "Send stand-down command to all configured robots.",
+                        "inputSchema": self.robot._empty_schema(),
+                    },
+                ]
+            )
+        return tools
+
+    def can_handle(self, name: str) -> bool:
+        if name in ("robot_cluster_stand_up", "robot_cluster_stand_down"):
+            return self.robot.enable_posture_tools
+        return name in self.TOOL_MAP
+
+    def call_tool(self, name: str, arguments: JsonDict) -> JsonDict:
+        target_tool = self.TOOL_MAP.get(name)
+        if target_tool is None or not self.can_handle(name):
+            raise ValueError("unknown cluster tool: %s" % name)
+
+        results: Dict[str, JsonDict] = {}
+        errors: Dict[str, str] = {}
+        lock = threading.Lock()
+
+        def worker(client: DomainMcpClient) -> None:
+            try:
+                result = client.call_tool(target_tool, arguments)
+                with lock:
+                    results[client.label] = result
+            except Exception as exc:
+                with lock:
+                    errors[client.label] = str(exc)
+
+        threads = [threading.Thread(target=worker, args=(client,)) for client in self.clients]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        ok = not errors and all(result.get("ok", False) for result in results.values())
+        return {
+            "ok": ok,
+            "action": name,
+            "target_tool": target_tool,
+            "robot_count": len(self.clients),
+            "results": results,
+            "errors": errors,
+        }
+
+    def shutdown(self) -> None:
+        for client in self.clients:
+            client.shutdown()
+
+
 class DiabloRobotBridge:
     """Translate high-level robot actions into /diablo/MotionCmd messages."""
 
@@ -61,6 +408,8 @@ class DiabloRobotBridge:
         self.motion_topic = os.environ.get("DIABLO_MOTION_TOPIC", "diablo/MotionCmd")
         self.status_topic = os.environ.get("DIABLO_STATUS_TOPIC", "diablo/sensor/Body_state")
         self.battery_topic = os.environ.get("DIABLO_BATTERY_TOPIC", "diablo/sensor/Battery")
+        self.robot_name = os.environ.get("DIABLO_ROBOT_NAME", "robot1").strip() or "robot1"
+        self.tool_prefix = os.environ.get("DIABLO_TOOL_PREFIX", self.robot_name + "_").strip()
 
         self.max_linear_speed = _env_float("DIABLO_MAX_LINEAR_SPEED", 0.5)
         self.max_turn_speed = _env_float("DIABLO_MAX_TURN_SPEED", 0.8)
@@ -89,7 +438,8 @@ class DiabloRobotBridge:
         self.enable_posture_tools = _env_bool("DIABLO_ENABLE_POSTURE_TOOLS", False)
 
         rclpy.init(args=None)
-        self.node: Node = rclpy.create_node("xiaozhi_robot_mcp_bridge")
+        node_name = os.environ.get("DIABLO_MCP_NODE_NAME", "xiaozhi_robot_mcp_bridge")
+        self.node: Node = rclpy.create_node(node_name)
         self.publisher = self.node.create_publisher(MotionCtrl, self.motion_topic, 10)
         self.node.create_subscription(RobotStatus, self.status_topic, self._status_callback, 10)
         self.node.create_subscription(BatteryState, self.battery_topic, self._battery_callback, 10)
@@ -103,9 +453,13 @@ class DiabloRobotBridge:
 
         self._spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         self._spin_thread.start()
+        self.cluster_tools = ClusterToolDispatcher.from_env(self)
         self._log(
-            "robot MCP bridge ready: motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s"
+            "robot MCP bridge ready: node=%s robot_name=%s tool_prefix=%s motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s cluster_domains=%s"
             % (
+                node_name,
+                self.robot_name,
+                self.tool_prefix,
                 self.motion_topic,
                 self.max_linear_speed,
                 self.max_turn_speed,
@@ -120,6 +474,9 @@ class DiabloRobotBridge:
                 os.environ.get("ROS_DOMAIN_ID", ""),
                 os.environ.get("RMW_IMPLEMENTATION", ""),
                 os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", ""),
+                ",".join(client.domain_id for client in self.cluster_tools.clients)
+                if self.cluster_tools is not None
+                else "",
             )
         )
 
@@ -129,6 +486,11 @@ class DiabloRobotBridge:
         except Exception as exc:  # pragma: no cover - best effort shutdown
             self._log("stop during shutdown failed: %s" % exc)
         try:
+            if self.cluster_tools is not None:
+                self.cluster_tools.shutdown()
+        except Exception as exc:  # pragma: no cover - best effort shutdown
+            self._log("cluster shutdown failed: %s" % exc)
+        try:
             self.node.destroy_node()
         finally:
             rclpy.shutdown()
@@ -136,8 +498,8 @@ class DiabloRobotBridge:
     def tool_definitions(self) -> Iterable[JsonDict]:
         tools = [
             {
-                "name": "robot_stop",
-                "description": "Stop the robot immediately by publishing a zero motion command.",
+                "name": self._public_tool_name("robot_stop"),
+                "description": "Stop %s immediately by publishing a zero motion command." % self.robot_name,
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -145,28 +507,28 @@ class DiabloRobotBridge:
                 },
             },
             {
-                "name": "robot_move_forward",
-                "description": "Move the robot forward for a short bounded duration, then stop automatically.",
+                "name": self._public_tool_name("robot_move_forward"),
+                "description": "Move %s forward for a short bounded duration, then stop automatically." % self.robot_name,
                 "inputSchema": self._speed_duration_schema("Forward speed in meters per second."),
             },
             {
-                "name": "robot_move_backward",
-                "description": "Move the robot backward for a short bounded duration, then stop automatically.",
+                "name": self._public_tool_name("robot_move_backward"),
+                "description": "Move %s backward for a short bounded duration, then stop automatically." % self.robot_name,
                 "inputSchema": self._speed_duration_schema("Backward speed in meters per second."),
             },
             {
-                "name": "robot_turn_left",
-                "description": "Turn the robot left for a short bounded duration, then stop automatically.",
+                "name": self._public_tool_name("robot_turn_left"),
+                "description": "Turn %s left for a short bounded duration, then stop automatically." % self.robot_name,
                 "inputSchema": self._turn_duration_schema("Left turn angular speed in radians per second."),
             },
             {
-                "name": "robot_turn_right",
-                "description": "Turn the robot right for a short bounded duration, then stop automatically.",
+                "name": self._public_tool_name("robot_turn_right"),
+                "description": "Turn %s right for a short bounded duration, then stop automatically." % self.robot_name,
                 "inputSchema": self._turn_duration_schema("Right turn angular speed in radians per second."),
             },
             {
-                "name": "robot_raise_body",
-                "description": "Raise the robot body briefly using the same vertical control as the teleop up keys, then stop automatically.",
+                "name": self._public_tool_name("robot_raise_body"),
+                "description": "Raise %s body briefly using the same vertical control as the teleop up keys, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive vertical command value. Matches the teleop up control.",
                     self.default_vertical_speed,
@@ -174,8 +536,8 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_lower_body",
-                "description": "Lower the robot body briefly using the same vertical control as the teleop down key, then stop automatically.",
+                "name": self._public_tool_name("robot_lower_body"),
+                "description": "Lower %s body briefly using the same vertical control as the teleop down key, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive vertical command value. The server sends it as a negative up command.",
                     self.default_vertical_speed,
@@ -183,8 +545,8 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_pitch_up",
-                "description": "Tilt the robot body pitch upward briefly, then stop automatically.",
+                "name": self._public_tool_name("robot_pitch_up"),
+                "description": "Tilt %s body pitch upward briefly, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive pitch command value.",
                     self.default_pitch,
@@ -192,8 +554,8 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_pitch_down",
-                "description": "Tilt the robot body pitch downward briefly, then stop automatically.",
+                "name": self._public_tool_name("robot_pitch_down"),
+                "description": "Tilt %s body pitch downward briefly, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive pitch command value. The server sends it as a negative pitch command.",
                     self.default_pitch,
@@ -201,8 +563,8 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_roll_left",
-                "description": "Lean the robot body left briefly, then stop automatically.",
+                "name": self._public_tool_name("robot_roll_left"),
+                "description": "Lean %s body left briefly, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive roll command value. The server sends it as a negative roll command.",
                     self.default_roll,
@@ -210,8 +572,8 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_roll_right",
-                "description": "Lean the robot body right briefly, then stop automatically.",
+                "name": self._public_tool_name("robot_roll_right"),
+                "description": "Lean %s body right briefly, then stop automatically." % self.robot_name,
                 "inputSchema": self._axis_duration_schema(
                     "Positive roll command value.",
                     self.default_roll,
@@ -219,13 +581,13 @@ class DiabloRobotBridge:
                 ),
             },
             {
-                "name": "robot_reset_body_pose",
-                "description": "Reset motion, vertical, pitch, roll, and leg split commands to neutral.",
+                "name": self._public_tool_name("robot_reset_body_pose"),
+                "description": "Reset %s motion, vertical, pitch, roll, and leg split commands to neutral." % self.robot_name,
                 "inputSchema": self._empty_schema(),
             },
             {
-                "name": "robot_get_status",
-                "description": "Read the latest robot status and battery data received by ROS2.",
+                "name": self._public_tool_name("robot_get_status"),
+                "description": "Read the latest %s status and battery data received by ROS2." % self.robot_name,
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -237,21 +599,27 @@ class DiabloRobotBridge:
             tools.extend(
                 [
                     {
-                        "name": "robot_stand_up",
-                        "description": "Send a one-shot stand-up command, then command maximum body height.",
+                        "name": self._public_tool_name("robot_stand_up"),
+                        "description": "Send a one-shot stand-up command to %s, then command maximum body height." % self.robot_name,
                         "inputSchema": self._empty_schema(),
                     },
                     {
-                        "name": "robot_stand_down",
-                        "description": "Send a one-shot stand-down command, then reset to zero motion.",
+                        "name": self._public_tool_name("robot_stand_down"),
+                        "description": "Send a one-shot stand-down command to %s, then reset to zero motion." % self.robot_name,
                         "inputSchema": self._empty_schema(),
                     },
                 ]
             )
+        if self.cluster_tools is not None:
+            tools.extend(self.cluster_tools.tool_definitions())
         return tools
 
     def call_tool(self, name: str, arguments: JsonDict) -> JsonDict:
         self._log("tool call: %s arguments=%s" % (name, json.dumps(arguments or {}, ensure_ascii=False)))
+        if self.cluster_tools is not None and self.cluster_tools.can_handle(name):
+            return self.cluster_tools.call_tool(name, arguments or {})
+
+        name = self._canonical_tool_name(name)
         handlers: Dict[str, Callable[[JsonDict], JsonDict]] = {
             "robot_stop": lambda _: self.stop(),
             "robot_move_forward": self.move_forward,
@@ -275,6 +643,16 @@ class DiabloRobotBridge:
         if handler is None:
             raise ValueError("unknown tool: %s" % name)
         return handler(arguments or {})
+
+    def _public_tool_name(self, canonical_name: str) -> str:
+        if canonical_name.startswith("robot_") and self.tool_prefix:
+            return self.tool_prefix + canonical_name[len("robot_") :]
+        return canonical_name
+
+    def _canonical_tool_name(self, public_name: str) -> str:
+        if self.tool_prefix and public_name.startswith(self.tool_prefix):
+            return "robot_" + public_name[len(self.tool_prefix) :]
+        return public_name
 
     def move_forward(self, arguments: JsonDict) -> JsonDict:
         speed = self._bounded_speed(arguments, "speed", self.default_linear_speed, self.max_linear_speed)

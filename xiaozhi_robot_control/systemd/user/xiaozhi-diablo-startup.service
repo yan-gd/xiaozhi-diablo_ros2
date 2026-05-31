@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/diablo/diablo_ws/src/xiaozhi_robot_control
-ExecStart=/home/diablo/diablo_ws/src/xiaozhi_robot_control/scripts/start_xiaozhi_diablo.sh
+ExecStart=/usr/bin/env bash /home/diablo/diablo_ws/src/xiaozhi_robot_control/scripts/start_xiaozhi_diablo.sh
 Restart=always
 RestartSec=5
 KillMode=control-group

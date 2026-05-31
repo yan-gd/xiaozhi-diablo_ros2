@@ -24,7 +24,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     server = os.path.join(script_dir, "run_robot_mcp_stdio.sh")
     proc = subprocess.Popen(
-        [server],
+        ["bash", server],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,

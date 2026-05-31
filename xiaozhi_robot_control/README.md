@@ -153,14 +153,14 @@ export DIABLO_ENABLE_CLUSTER_TOOLS=false
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
-./scripts/run_diablo_ctrl_node_udp.sh
+bash ./scripts/run_diablo_ctrl_node_udp.sh
 ```
 
 如果需要后台运行：
 
 ```bash
 systemd-run --user --unit=diablo-ctrl-node --description=diablo-ctrl-node \
-  ~/diablo_ws/src/xiaozhi_robot_control/scripts/run_diablo_ctrl_node_udp.sh
+  bash ~/diablo_ws/src/xiaozhi_robot_control/scripts/run_diablo_ctrl_node_udp.sh
 ```
 
 ## 开机自启
@@ -169,7 +169,7 @@ systemd-run --user --unit=diablo-ctrl-node --description=diablo-ctrl-node \
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
-./scripts/install_simple_startup.sh
+bash ./scripts/install_simple_startup.sh
 ```
 
 本服务（`xiaozhi-diablo-startup`）默认会自动从 `~/.config/xiaozhi_robot_control/env` 或 `~/.bashrc` 中提取 `MCP_ENDPOINT` 接入点配置。
@@ -197,7 +197,7 @@ journalctl --user -u xiaozhi-diablo-startup.service -f
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
-./scripts/local_mcp_smoke_test.py
+python3 ./scripts/local_mcp_smoke_test.py
 ```
 
 这个测试会初始化 MCP、列出工具，并默认调用一次 `robot1_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
@@ -215,7 +215,7 @@ export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
 ```bash
 export ROS_DOMAIN_ID=51
 cd ~/diablo_ws/src/xiaozhi_robot_control
-./scripts/run_with_xiaozhi_endpoint.sh
+bash ./scripts/run_with_xiaozhi_endpoint.sh
 ```
 
 启动后到 `xiaozhi.me` 后台刷新 MCP 状态。在线后，小智就可以调用本目录暴露的 `robot_*` 工具。

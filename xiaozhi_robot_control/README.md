@@ -1,7 +1,7 @@
 # Xiaozhi Robot Control
 
 这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
-本工程默认配置为 `robot2`，使用 `ROS_DOMAIN_ID=52`，并注册同名集群控制工具。
+本工程默认配置为 `robot2`，使用 `ROS_DOMAIN_ID=52`，并作为普通被控端，不暴露集群调度工具。
 如果多台机器人在同一个局域网内同时运行，每台机器人必须使用不同的 `ROS_DOMAIN_ID`，否则同一个 `diablo/MotionCmd` 命令会被同域内所有机器人接收。
 
 ## 架构
@@ -36,7 +36,7 @@ xiaozhi.me MCP 接入点
 - `robot2_reset_body_pose`
 - `robot2_get_status`
 
-设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。三台机器人可以注册同名 `robot_cluster_*` 工具；每台机器人只在自己的 `ROS_DOMAIN_ID` 内执行本机动作：
+只在调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。调度端会为每个 `ROS_DOMAIN_ID` 保持一个常驻 worker，并通过 worker 并行分发命令：
 
 - `robot_cluster_stop`
 - `robot_cluster_move_forward(speed, duration_ms)`
@@ -122,26 +122,34 @@ export ROS_DOMAIN_ID=52
 export ROS_DOMAIN_ID=53
 ```
 
-仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并在三台机器人上都开启同名集群工具：
+仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并只在 `robot1` 上开启集群工具：
 
 ```bash
 # 机器人1
 export DIABLO_ROBOT_NAME=robot1
 export ROS_DOMAIN_ID=51
 export DIABLO_ENABLE_CLUSTER_TOOLS=true
+export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
+export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
+export DIABLO_CLUSTER_PRESTART=true
+export DIABLO_CLUSTER_CALL_RETRY_COUNT=2
+export DIABLO_CLUSTER_REQUIRE_SUBSCRIBER=true
+export DIABLO_CLUSTER_REQUIRE_ALL_READY=true
+export DIABLO_WAIT_FOR_SUBSCRIBER_MS=5000
+export DIABLO_DISCOVERY_SETTLE_MS=1500
 
 # 机器人2
 export DIABLO_ROBOT_NAME=robot2
 export ROS_DOMAIN_ID=52
-export DIABLO_ENABLE_CLUSTER_TOOLS=true
+export DIABLO_ENABLE_CLUSTER_TOOLS=false
 
 # 机器人3
 export DIABLO_ROBOT_NAME=robot3
 export ROS_DOMAIN_ID=53
-export DIABLO_ENABLE_CLUSTER_TOOLS=true
+export DIABLO_ENABLE_CLUSTER_TOOLS=false
 ```
 
-`robot_cluster_*` 工具不再通过某一台机器人中转。小智调用同名集群工具时，三台机器人各自收到 MCP 调用，并各自在自己的 ROS domain 发布本机 `diablo/MotionCmd`。
+`robot_cluster_*` 工具由 `robot1` 统一接收。它会预启动每个 domain 的 worker，worker 内部初始化自己的 ROS2 节点、等待 `diablo_ctrl_node` 订阅者，并在调用失败时自动重启重试。默认开启 `DIABLO_CLUSTER_REQUIRE_ALL_READY=true`：群控动作发出前会先确认三台 worker 都已经发现各自的运动订阅者；如果某台未就绪，本次动作会中止而不是只让部分机器人执行。这样单机控制仍由 `robot1_*`、`robot2_*`、`robot3_*` 完成，群控只通过 `robot_cluster_*` 入口完成。
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control

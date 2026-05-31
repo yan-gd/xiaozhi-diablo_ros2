@@ -1,7 +1,7 @@
 # Xiaozhi Robot Control
 
 这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
-本工程默认配置为 `robot1`，使用 `ROS_DOMAIN_ID=51`，并作为三机器人集群调度端。
+本工程默认配置为 `robot1`，使用 `ROS_DOMAIN_ID=51`，并注册同名集群控制工具。
 如果多台机器人在同一个局域网内同时运行，每台机器人必须使用不同的 `ROS_DOMAIN_ID`，否则同一个 `diablo/MotionCmd` 命令会被同域内所有机器人接收。
 
 ## 架构
@@ -36,7 +36,7 @@ xiaozhi.me MCP 接入点
 - `robot1_reset_body_pose`
 - `robot1_get_status`
 
-只在一台调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具：
+设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。三台机器人可以注册同名 `robot_cluster_*` 工具；每台机器人只在自己的 `ROS_DOMAIN_ID` 内执行本机动作：
 
 - `robot_cluster_stop`
 - `robot_cluster_move_forward(speed, duration_ms)`
@@ -122,17 +122,26 @@ export ROS_DOMAIN_ID=52
 export ROS_DOMAIN_ID=53
 ```
 
-本工程默认作为 `robot1` 和集群调度端使用；仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并只在 `robot1` 上开启集群工具：
+仍然保持每台机器人使用不同的 `ROS_DOMAIN_ID`，并在三台机器人上都开启同名集群工具：
 
 ```bash
+# 机器人1
 export DIABLO_ROBOT_NAME=robot1
 export ROS_DOMAIN_ID=51
 export DIABLO_ENABLE_CLUSTER_TOOLS=true
-export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
-export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
+
+# 机器人2
+export DIABLO_ROBOT_NAME=robot2
+export ROS_DOMAIN_ID=52
+export DIABLO_ENABLE_CLUSTER_TOOLS=true
+
+# 机器人3
+export DIABLO_ROBOT_NAME=robot3
+export ROS_DOMAIN_ID=53
+export DIABLO_ENABLE_CLUSTER_TOOLS=true
 ```
 
-`robot1` 会为每个 `ROS_DOMAIN_ID` 启动一个轻量子 MCP 发布器；小智调用 `robot_cluster_*` 工具时，`robot1` 会并行向三台机器人所在的 ROS domain 发布同一条命令。不要在三台机器人上同时开启 `DIABLO_ENABLE_CLUSTER_TOOLS`，否则小智后台会看到多套重复的集群工具。
+`robot_cluster_*` 工具不再通过某一台机器人中转。小智调用同名集群工具时，三台机器人各自收到 MCP 调用，并各自在自己的 ROS domain 发布本机 `diablo/MotionCmd`。
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control

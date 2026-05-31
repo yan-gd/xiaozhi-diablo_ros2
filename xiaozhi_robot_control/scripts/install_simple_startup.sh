@@ -6,6 +6,7 @@ PKG_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 USER_SYSTEMD_DIR="${HOME}/.config/systemd/user"
 
 mkdir -p "${USER_SYSTEMD_DIR}"
+chmod +x "${SCRIPT_DIR}"/*.sh
 install -m 0644 "${PKG_ROOT}/systemd/user/xiaozhi-diablo-startup.service" \
   "${USER_SYSTEMD_DIR}/xiaozhi-diablo-startup.service"
 

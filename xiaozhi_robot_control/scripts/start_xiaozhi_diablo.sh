@@ -81,13 +81,13 @@ if [ -z "${MCP_ENDPOINT:-}" ]; then
 fi
 
 cd "${PKG_ROOT}"
-./scripts/run_diablo_ctrl_node_udp.sh &
+bash ./scripts/run_diablo_ctrl_node_udp.sh &
 CTRL_PID=$!
 
 sleep "${DIABLO_CTRL_START_DELAY_SEC:-5}"
 
 cd "${PKG_ROOT}"
-./scripts/run_with_xiaozhi_endpoint.sh &
+bash ./scripts/run_with_xiaozhi_endpoint.sh &
 BRIDGE_PID=$!
 
 wait -n "${CTRL_PID}" "${BRIDGE_PID}"

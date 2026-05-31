@@ -17,4 +17,4 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-53}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${PKG_ROOT}/config/fastdds_udp_only.xml}"
 
-exec python3 "${SCRIPT_DIR}/xiaozhi_mcp_pipe.py" "${SCRIPT_DIR}/run_robot_mcp_stdio.sh"
+exec python3 "${SCRIPT_DIR}/xiaozhi_mcp_pipe.py" bash "${SCRIPT_DIR}/run_robot_mcp_stdio.sh"

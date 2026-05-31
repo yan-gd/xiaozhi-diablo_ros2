@@ -408,7 +408,7 @@ class DiabloRobotBridge:
         self.motion_topic = os.environ.get("DIABLO_MOTION_TOPIC", "diablo/MotionCmd")
         self.status_topic = os.environ.get("DIABLO_STATUS_TOPIC", "diablo/sensor/Body_state")
         self.battery_topic = os.environ.get("DIABLO_BATTERY_TOPIC", "diablo/sensor/Battery")
-        self.robot_name = os.environ.get("DIABLO_ROBOT_NAME", "robot1").strip() or "robot1"
+        self.robot_name = os.environ.get("DIABLO_ROBOT_NAME", "robot3").strip() or "robot3"
         self.tool_prefix = os.environ.get("DIABLO_TOOL_PREFIX", self.robot_name + "_").strip()
 
         self.max_linear_speed = _env_float("DIABLO_MAX_LINEAR_SPEED", 0.5)

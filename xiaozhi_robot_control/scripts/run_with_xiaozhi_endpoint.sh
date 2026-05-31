@@ -12,8 +12,8 @@ if [ -f "${DIABLO_WS}/install/setup.bash" ]; then
   source "${DIABLO_WS}/install/setup.bash"
 fi
 
-export DIABLO_ROBOT_NAME="${DIABLO_ROBOT_NAME:-robot1}"
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-51}"
+export DIABLO_ROBOT_NAME="${DIABLO_ROBOT_NAME:-robot3}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-53}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${PKG_ROOT}/config/fastdds_udp_only.xml}"
 

@@ -11,6 +11,7 @@ if [ -f "${DIABLO_WS}/install/setup.bash" ]; then
 fi
 
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-51}"
+export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-${PKG_ROOT}/config/fastdds_udp_only.xml}"
 

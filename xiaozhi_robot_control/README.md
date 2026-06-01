@@ -107,7 +107,7 @@ source install/setup.bash
 
 ## 启动机器人控制节点
 
-`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会使用当前环境里的 `ROS_DOMAIN_ID`，未设置时默认为 `5`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
+`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会使用当前环境里的 `ROS_DOMAIN_ID`，未设置时默认为 `51`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
 
 多机器人同网部署时，请给每台机器人配置不同的 `ROS_DOMAIN_ID`，并确保同一台机器人上的 `diablo_ctrl_node` 和 MCP 桥接服务使用相同的值。例如：
 
@@ -128,6 +128,8 @@ export ROS_DOMAIN_ID=53
 # 机器人1
 export DIABLO_ROBOT_NAME=robot1
 export ROS_DOMAIN_ID=51
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export DIABLO_ENABLE_CLUSTER_TOOLS=true
 export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
 export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
@@ -135,21 +137,26 @@ export DIABLO_CLUSTER_PRESTART=true
 export DIABLO_CLUSTER_CALL_RETRY_COUNT=2
 export DIABLO_CLUSTER_REQUIRE_SUBSCRIBER=true
 export DIABLO_CLUSTER_REQUIRE_ALL_READY=true
-export DIABLO_WAIT_FOR_SUBSCRIBER_MS=5000
-export DIABLO_DISCOVERY_SETTLE_MS=1500
+export DIABLO_CLUSTER_READY_RETRY_COUNT=3
+export DIABLO_WAIT_FOR_SUBSCRIBER_MS=15000
+export DIABLO_DISCOVERY_SETTLE_MS=2000
 
 # 机器人2
 export DIABLO_ROBOT_NAME=robot2
 export ROS_DOMAIN_ID=52
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export DIABLO_ENABLE_CLUSTER_TOOLS=false
 
 # 机器人3
 export DIABLO_ROBOT_NAME=robot3
 export ROS_DOMAIN_ID=53
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export DIABLO_ENABLE_CLUSTER_TOOLS=false
 ```
 
-`robot_cluster_*` 工具由 `robot1` 统一接收。它会预启动每个 domain 的 worker，worker 内部初始化自己的 ROS2 节点、等待 `diablo_ctrl_node` 订阅者，并在调用失败时自动重启重试。默认开启 `DIABLO_CLUSTER_REQUIRE_ALL_READY=true`：群控动作发出前会先确认三台 worker 都已经发现各自的运动订阅者；如果某台未就绪，本次动作会中止而不是只让部分机器人执行。这样单机控制仍由 `robot1_*`、`robot2_*`、`robot3_*` 完成，群控只通过 `robot_cluster_*` 入口完成。
+`robot_cluster_*` 工具由 `robot1` 统一接收。它会预启动每个 domain 的 worker，worker 内部初始化自己的 ROS2 节点、等待 `diablo_ctrl_node` 订阅者，并在调用失败时自动重启重试。默认开启 `DIABLO_CLUSTER_REQUIRE_ALL_READY=true`：群控动作发出前会先确认三台 worker 都已经发现各自的运动订阅者；如果某台未就绪，本次动作会中止而不是只让部分机器人执行。这样单机控制仍由 `robot1_*`、`robot2_*`、`robot3_*` 完成，群控只通过 `robot_cluster_*` 入口完成。若 `ros2 topic info /diablo/MotionCmd -v` 能看到订阅者但集群 worker 仍短暂提示未发现，可以继续调大 `DIABLO_WAIT_FOR_SUBSCRIBER_MS`。
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control
@@ -172,12 +179,15 @@ cd ~/diablo_ws/src/xiaozhi_robot_control
 bash ./scripts/install_simple_startup.sh
 ```
 
-本服务（`xiaozhi-diablo-startup`）默认会自动从 `~/.config/xiaozhi_robot_control/env` 或 `~/.bashrc` 中提取 `MCP_ENDPOINT` 接入点配置。
+本服务（`xiaozhi-diablo-startup`）只从 `~/.config/xiaozhi_robot_control/env` 读取运行配置。不要把 `MCP_ENDPOINT`、`ROS_DOMAIN_ID`、`DIABLO_*` 同时写在 `~/.bashrc` 里，避免 systemd 服务和交互终端使用不同配置。
 
-如果还未配置，您可以直接将以下命令添加到 `~/.bashrc` 中，并使用 `systemctl --user restart xiaozhi-diablo-startup.service` 重启服务即可生效：
+如果还未配置，先复制示例文件并填写 `MCP_ENDPOINT`，然后使用 `systemctl --user restart xiaozhi-diablo-startup.service` 重启服务即可生效：
 
 ```bash
-export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
+mkdir -p ~/.config/xiaozhi_robot_control
+cp ~/diablo_ws/src/xiaozhi_robot_control/config/xiaozhi_robot_control.env.example \
+  ~/.config/xiaozhi_robot_control/env
+nano ~/.config/xiaozhi_robot_control/env
 ```
 
 如果需要未登录桌面也能开机启动用户服务，执行一次：
@@ -204,10 +214,10 @@ python3 ./scripts/local_mcp_smoke_test.py
 
 ## 连接 xiaozhi.me
 
-在小智后台复制 MCP 接入点，例如：
+在小智后台复制 MCP 接入点，填入 `~/.config/xiaozhi_robot_control/env`：
 
 ```bash
-export MCP_ENDPOINT='wss://api.xiaozhi.me/mcp/?token=你的token'
+nano ~/.config/xiaozhi_robot_control/env
 ```
 
 本目录已经内置了一个轻量版 `scripts/xiaozhi_mcp_pipe.py`，不需要额外准备官方 `mcp_pipe.py`。

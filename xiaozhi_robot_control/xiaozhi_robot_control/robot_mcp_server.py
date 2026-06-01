@@ -60,6 +60,12 @@ def _env_csv(name: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _subscriber_wait_timeout_s(extra_s: float = 3.0) -> float:
+    wait_s = max(0.0, _env_int("DIABLO_WAIT_FOR_SUBSCRIBER_MS", 2000) / 1000.0)
+    settle_s = max(0.0, _env_int("DIABLO_DISCOVERY_SETTLE_MS", 1000) / 1000.0)
+    return max(5.0, wait_s + settle_s + extra_s)
+
+
 class DomainWorkerClient:
     """Persistent helper process that publishes commands in one ROS domain."""
 
@@ -72,7 +78,8 @@ class DomainWorkerClient:
 
     def warm(self) -> JsonDict:
         with self._lock:
-            return self._request_with_restart_locked("warm", {}, timeout_s=10.0)
+            timeout_s = _env_float("DIABLO_CLUSTER_WARM_TIMEOUT_SEC", _subscriber_wait_timeout_s(5.0))
+            return self._request_with_restart_locked("warm", {}, timeout_s=timeout_s)
 
     def ready(self, timeout_s: float) -> JsonDict:
         with self._lock:
@@ -184,7 +191,7 @@ class DomainWorkerClient:
                     self._request_locked(
                         "call_tool",
                         {"name": "robot_stop", "arguments": {}},
-                        timeout_s=8.0,
+                        timeout_s=_subscriber_wait_timeout_s(5.0),
                     )
                 except Exception:
                     pass
@@ -484,7 +491,9 @@ class ClusterToolDispatcher:
     def _tool_timeout_s(self, arguments: JsonDict) -> float:
         duration_ms = int(arguments.get("duration_ms", self.robot.default_duration_ms))
         duration_s = max(0.0, duration_ms / 1000.0)
-        return duration_s + max(5.0, _env_float("DIABLO_CLUSTER_WORKER_TIMEOUT_EXTRA_SEC", 8.0))
+        subscriber_wait_s = self._default_ready_timeout_s()
+        extra_s = max(5.0, _env_float("DIABLO_CLUSTER_WORKER_TIMEOUT_EXTRA_SEC", 8.0))
+        return duration_s + subscriber_wait_s + extra_s
 
     def _default_ready_timeout_s(self) -> float:
         wait_s = max(0.0, self.robot.wait_for_subscriber_ms / 1000.0)

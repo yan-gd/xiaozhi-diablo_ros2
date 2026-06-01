@@ -1,7 +1,7 @@
 # Xiaozhi Robot Control
 
 这个目录是独立的小智语音控制桥接功能，不修改原有 `diablo_ctrl`、`diablo_utils` 等官方代码。
-本工程默认配置为 `robot1`，使用 `ROS_DOMAIN_ID=51`，并作为三机器人集群调度端。
+本分支默认配置为 `robot2`，使用 `ROS_DOMAIN_ID=52`，不开启集群调度工具。运行配置仍统一从 `~/.config/xiaozhi_robot_control/env` 读取。
 如果多台机器人在同一个局域网内同时运行，每台机器人必须使用不同的 `ROS_DOMAIN_ID`，否则同一个 `diablo/MotionCmd` 命令会被同域内所有机器人接收。
 
 ## 架构
@@ -20,21 +20,21 @@ xiaozhi.me MCP 接入点
 
 ## 暴露给小智的工具
 
-默认 `DIABLO_ROBOT_NAME=robot1`，所以本机单独控制工具会暴露为：
+默认 `DIABLO_ROBOT_NAME=robot2`，所以本机单独控制工具会暴露为：
 
-- `robot1_stop`
-- `robot1_move_forward(speed, duration_ms)`
-- `robot1_move_backward(speed, duration_ms)`
-- `robot1_turn_left(speed, duration_ms)`
-- `robot1_turn_right(speed, duration_ms)`
-- `robot1_raise_body(value, duration_ms)`
-- `robot1_lower_body(value, duration_ms)`
-- `robot1_pitch_up(value, duration_ms)`
-- `robot1_pitch_down(value, duration_ms)`
-- `robot1_roll_left(value, duration_ms)`
-- `robot1_roll_right(value, duration_ms)`
-- `robot1_reset_body_pose`
-- `robot1_get_status`
+- `robot2_stop`
+- `robot2_move_forward(speed, duration_ms)`
+- `robot2_move_backward(speed, duration_ms)`
+- `robot2_turn_left(speed, duration_ms)`
+- `robot2_turn_right(speed, duration_ms)`
+- `robot2_raise_body(value, duration_ms)`
+- `robot2_lower_body(value, duration_ms)`
+- `robot2_pitch_up(value, duration_ms)`
+- `robot2_pitch_down(value, duration_ms)`
+- `robot2_roll_left(value, duration_ms)`
+- `robot2_roll_right(value, duration_ms)`
+- `robot2_reset_body_pose`
+- `robot2_get_status`
 
 只在调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。调度端会为每个 `ROS_DOMAIN_ID` 保持一个常驻 worker，并通过 worker 并行分发命令：
 
@@ -60,8 +60,8 @@ export DIABLO_ENABLE_POSTURE_TOOLS=0
 
 开启时会额外暴露：
 
-- `robot1_stand_up`
-- `robot1_stand_down`
+- `robot2_stand_up`
+- `robot2_stand_down`
 
 同时开启集群工具和站立/趴下动作时，会额外暴露：
 
@@ -107,7 +107,7 @@ source install/setup.bash
 
 ## 启动机器人控制节点
 
-`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会使用当前环境里的 `ROS_DOMAIN_ID`，未设置时默认为 `51`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
+`diablo_ctrl_node` 是真正和下位机运动控制板通信的节点。建议用本目录的启动脚本，它会使用当前环境里的 `ROS_DOMAIN_ID`，未设置时本分支默认为 `52`，并使用 `config/fastdds_udp_only.xml` 禁用 FastDDS 共享内存传输，避免部分 Foxy/FastDDS 环境下出现 `std::system_error: Bad address`。
 
 多机器人同网部署时，请给每台机器人配置不同的 `ROS_DOMAIN_ID`，并确保同一台机器人上的 `diablo_ctrl_node` 和 MCP 桥接服务使用相同的值。例如：
 
@@ -210,7 +210,7 @@ cd ~/diablo_ws/src/xiaozhi_robot_control
 python3 ./scripts/local_mcp_smoke_test.py
 ```
 
-这个测试会初始化 MCP、列出工具，并默认调用一次 `robot1_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
+这个测试会初始化 MCP、列出工具，并默认调用一次 `robot2_stop`。服务也兼容内部旧名 `robot_stop`。它只发布 ROS2 消息，不会直接操作串口。
 
 ## 连接 xiaozhi.me
 
@@ -223,7 +223,7 @@ nano ~/.config/xiaozhi_robot_control/env
 本目录已经内置了一个轻量版 `scripts/xiaozhi_mcp_pipe.py`，不需要额外准备官方 `mcp_pipe.py`。
 
 ```bash
-export ROS_DOMAIN_ID=51
+export ROS_DOMAIN_ID=52
 cd ~/diablo_ws/src/xiaozhi_robot_control
 bash ./scripts/run_with_xiaozhi_endpoint.sh
 ```

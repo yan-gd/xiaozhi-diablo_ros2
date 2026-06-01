@@ -36,7 +36,7 @@ xiaozhi.me MCP 接入点
 - `robot1_reset_body_pose`
 - `robot1_get_status`
 
-只在调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。调度端会为每个 `ROS_DOMAIN_ID` 保持一个常驻 worker，并通过 worker 并行分发命令：
+只在调度机器人上设置 `DIABLO_ENABLE_CLUSTER_TOOLS=true` 时，会额外暴露集群工具。调度端在本机直接发布 robot1 命令，对 robot2/robot3 通过 UDP relay 请求它们在本机发布 `/diablo/MotionCmd`，避免跨机器 DDS 数据面不稳定导致只发现节点但命令不到达：
 
 - `robot_cluster_stop`
 - `robot_cluster_move_forward(speed, duration_ms)`
@@ -135,8 +135,10 @@ export DIABLO_CLUSTER_ROS_DOMAIN_IDS=51,52,53
 export DIABLO_CLUSTER_ROBOT_NAMES=robot1,robot2,robot3
 export DIABLO_CLUSTER_PRESTART=true
 export DIABLO_CLUSTER_CALL_RETRY_COUNT=2
-export DIABLO_CLUSTER_REQUIRE_SUBSCRIBER=true
-export DIABLO_CLUSTER_REQUIRE_ALL_READY=true
+export DIABLO_CLUSTER_RELAY_KEY=replace-with-random-shared-key
+export DIABLO_CLUSTER_UDP_TARGETS=robot2=10.131.89.204:8765,robot3=10.131.89.63:8765
+export DIABLO_CLUSTER_REQUIRE_SUBSCRIBER=false
+export DIABLO_CLUSTER_REQUIRE_ALL_READY=false
 export DIABLO_CLUSTER_READY_RETRY_COUNT=3
 export DIABLO_WAIT_FOR_SUBSCRIBER_MS=15000
 export DIABLO_DISCOVERY_SETTLE_MS=2000
@@ -147,6 +149,9 @@ export ROS_DOMAIN_ID=52
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export DIABLO_ENABLE_CLUSTER_TOOLS=false
+export DIABLO_UDP_RELAY_LISTEN=true
+export DIABLO_UDP_RELAY_PORT=8765
+export DIABLO_UDP_RELAY_KEY=replace-with-random-shared-key
 
 # 机器人3
 export DIABLO_ROBOT_NAME=robot3
@@ -154,9 +159,12 @@ export ROS_DOMAIN_ID=53
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export DIABLO_ENABLE_CLUSTER_TOOLS=false
+export DIABLO_UDP_RELAY_LISTEN=true
+export DIABLO_UDP_RELAY_PORT=8765
+export DIABLO_UDP_RELAY_KEY=replace-with-random-shared-key
 ```
 
-`robot_cluster_*` 工具由 `robot1` 统一接收。它会预启动每个 domain 的 worker，worker 内部初始化自己的 ROS2 节点、等待 `diablo_ctrl_node` 订阅者，并在调用失败时自动重启重试。默认开启 `DIABLO_CLUSTER_REQUIRE_ALL_READY=true`：群控动作发出前会先确认三台 worker 都已经发现各自的运动订阅者；如果某台未就绪，本次动作会中止而不是只让部分机器人执行。这样单机控制仍由 `robot1_*`、`robot2_*`、`robot3_*` 完成，群控只通过 `robot_cluster_*` 入口完成。若 `ros2 topic info /diablo/MotionCmd -v` 能看到订阅者但集群 worker 仍短暂提示未发现，可以继续调大 `DIABLO_WAIT_FOR_SUBSCRIBER_MS`。
+`robot_cluster_*` 工具由 `robot1` 统一接收。robot1 本机直接执行 robot1 的动作；远端机器人由 UDP relay 接收带签名的 JSON 请求，并在远端本机调用同一套单机器人工具。`DIABLO_CLUSTER_RELAY_KEY` 和 `DIABLO_UDP_RELAY_KEY` 必须一致；不要使用示例值。这样单机控制仍由 `robot1_*`、`robot2_*`、`robot3_*` 完成，群控只通过 `robot_cluster_*` 入口完成。
 
 ```bash
 cd ~/diablo_ws/src/xiaozhi_robot_control

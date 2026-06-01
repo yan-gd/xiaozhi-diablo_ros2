@@ -7,9 +7,11 @@ of JSON-RPC methods needed by MCP clients such as xiaozhi mcp_pipe.
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
-import subprocess
+import socket
 import sys
 import threading
 import time
@@ -60,164 +62,161 @@ def _env_csv(name: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _subscriber_wait_timeout_s(extra_s: float = 3.0) -> float:
-    wait_s = max(0.0, _env_int("DIABLO_WAIT_FOR_SUBSCRIBER_MS", 2000) / 1000.0)
-    settle_s = max(0.0, _env_int("DIABLO_DISCOVERY_SETTLE_MS", 1000) / 1000.0)
-    return max(5.0, wait_s + settle_s + extra_s)
+def _json_for_signature(payload: JsonDict) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
-class DomainWorkerClient:
-    """Persistent helper process that publishes commands in one ROS domain."""
+def _relay_signature(key: str, payload: JsonDict) -> str:
+    return hmac.new(key.encode("utf-8"), _json_for_signature(payload), hashlib.sha256).hexdigest()
 
-    def __init__(self, domain_id: str, label: str) -> None:
-        self.domain_id = domain_id
+
+def _parse_udp_targets(value: str) -> Dict[str, Tuple[str, int]]:
+    targets: Dict[str, Tuple[str, int]] = {}
+    for item in [part.strip() for part in value.split(",") if part.strip()]:
+        if "=" not in item:
+            continue
+        label, address = [part.strip() for part in item.split("=", 1)]
+        if not label or ":" not in address:
+            continue
+        host, port_text = address.rsplit(":", 1)
+        try:
+            port = int(port_text)
+        except ValueError:
+            continue
+        targets[label] = (host.strip(), port)
+    return targets
+
+
+class LocalClusterTarget:
+    """Cluster target that executes against the current robot process."""
+
+    def __init__(self, robot: "DiabloRobotBridge", label: str, domain_id: str) -> None:
+        self.robot = robot
         self.label = label
-        self.process: Optional[subprocess.Popen] = None
+        self.domain_id = domain_id
+
+    def warm(self) -> JsonDict:
+        return self.ready(timeout_s=0.0)
+
+    def ready(self, timeout_s: float) -> JsonDict:
+        del timeout_s
+        return {
+            "ok": True,
+            "robot_name": self.robot.robot_name,
+            "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+            "transport": "local",
+        }
+
+    def call_tool(self, name: str, arguments: JsonDict, timeout_s: float) -> JsonDict:
+        del timeout_s
+        return {
+            "ok": True,
+            "robot_name": self.robot.robot_name,
+            "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+            "transport": "local",
+            "tool_result": self.robot._call_canonical_tool(name, arguments or {}),
+        }
+
+    def shutdown(self) -> None:
+        return
+
+
+class MissingClusterTarget:
+    """Placeholder used when a remote robot has no UDP relay target configured."""
+
+    def __init__(self, label: str, domain_id: str) -> None:
+        self.label = label
+        self.domain_id = domain_id
+
+    def warm(self) -> JsonDict:
+        raise RuntimeError(self._message())
+
+    def ready(self, timeout_s: float) -> JsonDict:
+        del timeout_s
+        raise RuntimeError(self._message())
+
+    def call_tool(self, name: str, arguments: JsonDict, timeout_s: float) -> JsonDict:
+        del name, arguments, timeout_s
+        raise RuntimeError(self._message())
+
+    def shutdown(self) -> None:
+        return
+
+    def _message(self) -> str:
+        return (
+            "missing UDP relay target for %s; set DIABLO_CLUSTER_UDP_TARGETS="
+            "robot2=IP:8765,robot3=IP:8765 on the dispatcher"
+        ) % self.label
+
+
+class UdpClusterTarget:
+    """Cluster target that asks a remote robot to publish locally over UDP."""
+
+    def __init__(self, label: str, domain_id: str, host: str, port: int, key: str) -> None:
+        self.label = label
+        self.domain_id = domain_id
+        self.host = host
+        self.port = port
+        self.key = key
         self._lock = threading.Lock()
         self._request_id = 0
 
     def warm(self) -> JsonDict:
-        with self._lock:
-            timeout_s = _env_float("DIABLO_CLUSTER_WARM_TIMEOUT_SEC", _subscriber_wait_timeout_s(5.0))
-            return self._request_with_restart_locked("warm", {}, timeout_s=timeout_s)
+        timeout_s = _env_float("DIABLO_CLUSTER_UDP_READY_TIMEOUT_SEC", 2.0)
+        return self._request("ping", {}, timeout_s=timeout_s)
 
     def ready(self, timeout_s: float) -> JsonDict:
-        with self._lock:
-            return self._request_with_restart_locked("ready", {}, timeout_s=timeout_s)
+        return self._request("ping", {}, timeout_s=max(0.2, timeout_s))
 
     def call_tool(self, name: str, arguments: JsonDict, timeout_s: float) -> JsonDict:
-        with self._lock:
-            return self._request_with_restart_locked(
-                "call_tool",
-                {"name": name, "arguments": arguments or {}},
-                timeout_s=timeout_s,
-            )
+        return self._request(
+            "call_tool",
+            {"name": name, "arguments": arguments or {}},
+            timeout_s=timeout_s,
+        )
 
     def shutdown(self) -> None:
+        return
+
+    def _request(self, method: str, params: JsonDict, timeout_s: float) -> JsonDict:
+        if not self.key:
+            raise RuntimeError("DIABLO_CLUSTER_RELAY_KEY is required for UDP relay")
+
         with self._lock:
-            self._stop_locked(send_stop=True)
+            self._request_id += 1
+            request_id = self._request_id
 
-    def _request_with_restart_locked(self, method: str, params: JsonDict, timeout_s: float) -> JsonDict:
-        attempts = max(1, _env_int("DIABLO_CLUSTER_WORKER_RESTART_ATTEMPTS", 2))
-        last_error = ""
-        for attempt in range(attempts):
-            try:
-                self._ensure_started_locked()
-                return self._request_locked(method, params, timeout_s=timeout_s)
-            except Exception as exc:
-                last_error = str(exc)
-                self._stop_locked(send_stop=False)
-                if attempt + 1 >= attempts:
-                    break
-        raise RuntimeError(last_error or "worker request failed")
+        payload: JsonDict = {
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+            "sender": os.environ.get("DIABLO_ROBOT_NAME", ""),
+            "target": self.label,
+            "ts": round(time.time(), 3),
+        }
+        payload["sig"] = _relay_signature(self.key, payload)
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    def _ensure_started_locked(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            return
-
-        env = os.environ.copy()
-        env["ROS_DOMAIN_ID"] = str(self.domain_id)
-        env["DIABLO_ENABLE_CLUSTER_TOOLS"] = "0"
-        env["DIABLO_ROBOT_NAME"] = self.label
-        env["DIABLO_MCP_NODE_NAME"] = "xiaozhi_cluster_worker_%s" % self._safe_label()
-
-        command = [sys.executable, os.path.abspath(__file__), "--domain-worker"]
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            env=env,
-        )
-        threading.Thread(target=self._stderr_loop, daemon=True).start()
-
-    def _request_locked(self, method: str, params: JsonDict, timeout_s: float) -> JsonDict:
-        if self.process is None or self.process.stdin is None or self.process.stdout is None:
-            raise RuntimeError("domain worker is not running")
-        if self.process.poll() is not None:
-            raise RuntimeError("domain worker exited with code %s" % self.process.returncode)
-
-        self._request_id += 1
-        request_id = self._request_id
-        self.process.stdin.write(
-            json.dumps(
-                {
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        self.process.stdin.flush()
-
-        response_box: Dict[str, Any] = {}
-
-        def read_response() -> None:
-            try:
-                line = self.process.stdout.readline() if self.process is not None and self.process.stdout is not None else ""
-                response_box["line"] = line
-            except Exception as exc:
-                response_box["error"] = exc
-
-        reader = threading.Thread(target=read_response, daemon=True)
-        reader.start()
-        reader.join(timeout_s)
-        if reader.is_alive():
-            raise TimeoutError("domain worker request timed out after %.1fs" % timeout_s)
-        if "error" in response_box:
-            raise RuntimeError(str(response_box["error"]))
-
-        line = response_box.get("line", "")
-        if not line:
-            raise RuntimeError("domain worker closed stdout")
-        response = json.loads(line)
-        if response.get("id") != request_id:
-            raise RuntimeError("domain worker response id mismatch")
-        if "error" in response:
-            raise RuntimeError(response["error"])
-        return response.get("result") or {}
-
-    def _stop_locked(self, send_stop: bool) -> None:
-        if self.process is None:
-            return
-        try:
-            if send_stop and self.process.poll() is None:
-                try:
-                    self._request_locked(
-                        "call_tool",
-                        {"name": "robot_stop", "arguments": {}},
-                        timeout_s=_subscriber_wait_timeout_s(5.0),
-                    )
-                except Exception:
-                    pass
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-        finally:
-            self.process = None
-
-    def _stderr_loop(self) -> None:
-        if self.process is None or self.process.stderr is None:
-            return
-        for line in self.process.stderr:
-            sys.stderr.write("[cluster:%s:%s] %s" % (self.label, self.domain_id, line))
-            sys.stderr.flush()
-
-    def _safe_label(self) -> str:
-        return "".join(ch if ch.isalnum() else "_" for ch in self.label) or self.domain_id
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout_s)
+            sock.sendto(encoded, (self.host, self.port))
+            while True:
+                data, _addr = sock.recvfrom(65535)
+                response = json.loads(data.decode("utf-8"))
+                if response.get("id") != request_id:
+                    continue
+                if "error" in response:
+                    raise RuntimeError(str(response["error"]))
+                return response.get("result") or {}
 
 
 class ClusterToolDispatcher:
-    """Fan out cluster tool calls to persistent per-domain workers."""
+    """Fan out cluster tool calls to local or UDP relay targets."""
 
     TOOL_MAP = {
         "robot_cluster_stop": "robot_stop",
@@ -239,10 +238,21 @@ class ClusterToolDispatcher:
 
     def __init__(self, robot: "DiabloRobotBridge", domains: List[str], labels: List[str]) -> None:
         self.robot = robot
-        self.workers = [
-            DomainWorkerClient(domain_id, labels[index] if index < len(labels) else "robot%d" % (index + 1))
-            for index, domain_id in enumerate(domains)
-        ]
+        udp_targets = _parse_udp_targets(os.environ.get("DIABLO_CLUSTER_UDP_TARGETS", ""))
+        relay_key = os.environ.get("DIABLO_CLUSTER_RELAY_KEY", os.environ.get("DIABLO_UDP_RELAY_KEY", ""))
+        local_domain = os.environ.get("ROS_DOMAIN_ID", "")
+        self.targets: List[Any] = []
+        for index, domain_id in enumerate(domains):
+            label = labels[index] if index < len(labels) else "robot%d" % (index + 1)
+            if label == robot.robot_name or domain_id == local_domain:
+                self.targets.append(LocalClusterTarget(robot, label, domain_id))
+                continue
+            target = udp_targets.get(label)
+            if target is None:
+                self.targets.append(MissingClusterTarget(label, domain_id))
+                continue
+            host, port = target
+            self.targets.append(UdpClusterTarget(label, domain_id, host, port, relay_key))
 
     @classmethod
     def from_env(cls, robot: "DiabloRobotBridge") -> Optional["ClusterToolDispatcher"]:
@@ -259,14 +269,14 @@ class ClusterToolDispatcher:
         errors: Dict[str, str] = {}
         lock = threading.Lock()
 
-        def worker_thread(worker: DomainWorkerClient) -> None:
+        def target_thread(target: Any) -> None:
             try:
-                worker.warm()
+                target.warm()
             except Exception as exc:
                 with lock:
-                    errors[worker.label] = str(exc)
+                    errors[target.label] = str(exc)
 
-        threads = [threading.Thread(target=worker_thread, args=(worker,)) for worker in self.workers]
+        threads = [threading.Thread(target=target_thread, args=(target,)) for target in self.targets]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -395,15 +405,15 @@ class ClusterToolDispatcher:
 
         arguments = arguments or {}
         if self._requires_ready(target_tool) and _env_bool("DIABLO_CLUSTER_REQUIRE_ALL_READY", True):
-            ready_results, ready_errors = self._prepare_workers()
+            ready_results, ready_errors = self._prepare_targets()
             if ready_errors:
                 return {
                     "ok": False,
                     "action": name,
                     "target_tool": target_tool,
-                    "robot_count": len(self.workers),
+                    "robot_count": len(self.targets),
                     "aborted": True,
-                    "reason": "not all cluster workers are ready",
+                    "reason": "not all cluster targets are ready",
                     "ready_results": ready_results,
                     "errors": ready_errors,
                 }
@@ -414,42 +424,42 @@ class ClusterToolDispatcher:
         errors: Dict[str, str] = {}
         lock = threading.Lock()
 
-        def worker_thread(worker: DomainWorkerClient) -> None:
+        def target_thread(target: Any) -> None:
             last_error = ""
             for attempt in range(retry_count):
                 try:
-                    result = worker.call_tool(target_tool, arguments or {}, timeout_s=timeout_s)
+                    result = target.call_tool(target_tool, arguments or {}, timeout_s=timeout_s)
                     with lock:
-                        results[worker.label] = result
-                        errors.pop(worker.label, None)
+                        results[target.label] = result
+                        errors.pop(target.label, None)
                     return
                 except Exception as exc:
                     last_error = str(exc)
                     if attempt + 1 < retry_count:
                         time.sleep(0.1)
             with lock:
-                errors[worker.label] = last_error or "cluster worker failed"
+                errors[target.label] = last_error or "cluster target failed"
 
-        threads = [threading.Thread(target=worker_thread, args=(worker,)) for worker in self.workers]
+        threads = [threading.Thread(target=target_thread, args=(target,)) for target in self.targets]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
 
         return {
-            "ok": not errors and len(results) == len(self.workers),
+            "ok": not errors and len(results) == len(self.targets),
             "action": name,
             "target_tool": target_tool,
-            "robot_count": len(self.workers),
+            "robot_count": len(self.targets),
             "results": results,
             "errors": errors,
         }
 
     def shutdown(self) -> None:
-        for worker in self.workers:
-            worker.shutdown()
+        for target in self.targets:
+            target.shutdown()
 
-    def _prepare_workers(self) -> Tuple[Dict[str, JsonDict], Dict[str, str]]:
+    def _prepare_targets(self) -> Tuple[Dict[str, JsonDict], Dict[str, str]]:
         retry_count = max(
             1,
             _env_int(
@@ -462,23 +472,23 @@ class ClusterToolDispatcher:
         errors: Dict[str, str] = {}
         lock = threading.Lock()
 
-        def worker_thread(worker: DomainWorkerClient) -> None:
+        def target_thread(target: Any) -> None:
             last_error = ""
             for attempt in range(retry_count):
                 try:
-                    result = worker.ready(timeout_s=timeout_s)
+                    result = target.ready(timeout_s=timeout_s)
                     with lock:
-                        results[worker.label] = result
-                        errors.pop(worker.label, None)
+                        results[target.label] = result
+                        errors.pop(target.label, None)
                     return
                 except Exception as exc:
                     last_error = str(exc)
                     if attempt + 1 < retry_count:
                         time.sleep(0.2)
             with lock:
-                errors[worker.label] = last_error or "cluster worker is not ready"
+                errors[target.label] = last_error or "cluster target is not ready"
 
-        threads = [threading.Thread(target=worker_thread, args=(worker,)) for worker in self.workers]
+        threads = [threading.Thread(target=target_thread, args=(target,)) for target in self.targets]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -491,14 +501,11 @@ class ClusterToolDispatcher:
     def _tool_timeout_s(self, arguments: JsonDict) -> float:
         duration_ms = int(arguments.get("duration_ms", self.robot.default_duration_ms))
         duration_s = max(0.0, duration_ms / 1000.0)
-        subscriber_wait_s = self._default_ready_timeout_s()
         extra_s = max(5.0, _env_float("DIABLO_CLUSTER_WORKER_TIMEOUT_EXTRA_SEC", 8.0))
-        return duration_s + subscriber_wait_s + extra_s
+        return duration_s + extra_s
 
     def _default_ready_timeout_s(self) -> float:
-        wait_s = max(0.0, self.robot.wait_for_subscriber_ms / 1000.0)
-        settle_s = max(0.0, self.robot.discovery_settle_ms / 1000.0)
-        return max(5.0, wait_s + settle_s + 3.0)
+        return max(1.0, _env_float("DIABLO_CLUSTER_UDP_READY_TIMEOUT_SEC", 2.0))
 
 
 class DiabloRobotBridge:
@@ -550,12 +557,16 @@ class DiabloRobotBridge:
         self._latest_battery: Optional[BatteryState] = None
         self._latest_battery_time = 0.0
         self._motion_subscriber_seen = False
+        self._udp_relay_socket: Optional[socket.socket] = None
+        self._udp_relay_stop = threading.Event()
+        self._udp_relay_thread: Optional[threading.Thread] = None
 
         self._spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
         self._spin_thread.start()
+        self._start_udp_relay()
         self.cluster_tools = ClusterToolDispatcher.from_env(self)
         self._log(
-            "robot MCP bridge ready: node=%s robot_name=%s tool_prefix=%s motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s cluster_tools=%s"
+                "robot MCP bridge ready: node=%s robot_name=%s tool_prefix=%s motion_topic=%s max_linear=%.2f max_turn=%.2f default_linear=%.2f min_duration_ms=%d max_duration_ms=%d default_up=%.2f default_vertical=%.2f stand_up_height=%.2f default_pitch=%.2f default_roll=%.2f ros_domain_id=%s rmw=%s fastdds_profile=%s cluster_tools=%s udp_relay=%s"
             % (
                 node_name,
                 self.robot_name,
@@ -575,10 +586,113 @@ class DiabloRobotBridge:
                 os.environ.get("RMW_IMPLEMENTATION", ""),
                 os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", ""),
                 "enabled" if self.cluster_tools is not None else "disabled",
+                "enabled" if self._udp_relay_socket is not None else "disabled",
             )
         )
 
+    def _start_udp_relay(self) -> None:
+        if not _env_bool("DIABLO_UDP_RELAY_LISTEN", False):
+            return
+        key = os.environ.get("DIABLO_UDP_RELAY_KEY", os.environ.get("DIABLO_CLUSTER_RELAY_KEY", ""))
+        if not key:
+            self._log("UDP relay disabled: DIABLO_UDP_RELAY_KEY is not set")
+            return
+        host = os.environ.get("DIABLO_UDP_RELAY_HOST", "0.0.0.0")
+        port = _env_int("DIABLO_UDP_RELAY_PORT", 8765)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.settimeout(0.5)
+        except Exception:
+            sock.close()
+            raise
+        self._udp_relay_socket = sock
+        self._udp_relay_thread = threading.Thread(target=self._udp_relay_loop, daemon=True)
+        self._udp_relay_thread.start()
+        self._log("UDP relay listening on %s:%d" % (host, port))
+
+    def _udp_relay_loop(self) -> None:
+        assert self._udp_relay_socket is not None
+        while not self._udp_relay_stop.is_set():
+            try:
+                data, addr = self._udp_relay_socket.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self._handle_udp_relay_request(data, addr)
+
+    def _handle_udp_relay_request(self, data: bytes, addr: Tuple[str, int]) -> None:
+        request_id: Any = None
+        response: JsonDict
+        try:
+            request = json.loads(data.decode("utf-8"))
+            request_id = request.get("id")
+            self._verify_udp_relay_request(request)
+            method = request.get("method")
+            params = request.get("params") or {}
+            if method in ("ping", "warm", "ready"):
+                response = {
+                    "id": request_id,
+                    "result": {
+                        "ok": True,
+                        "robot_name": self.robot_name,
+                        "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+                        "transport": "udp",
+                    },
+                }
+            elif method == "call_tool":
+                name = self._canonical_tool_name(str(params.get("name", "")))
+                if name.startswith("robot_cluster_"):
+                    raise ValueError("UDP relay only accepts single-robot tools")
+                result = self._call_canonical_tool(name, params.get("arguments") or {})
+                response = {
+                    "id": request_id,
+                    "result": {
+                        "ok": True,
+                        "robot_name": self.robot_name,
+                        "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+                        "transport": "udp",
+                        "tool_result": result,
+                    },
+                }
+            else:
+                raise ValueError("unknown UDP relay method: %s" % method)
+        except Exception as exc:
+            response = {"id": request_id, "error": str(exc)}
+        try:
+            encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
+            if self._udp_relay_socket is not None:
+                self._udp_relay_socket.sendto(encoded, addr)
+        except Exception as exc:
+            self._log("UDP relay response failed: %s" % exc)
+
+    def _verify_udp_relay_request(self, request: JsonDict) -> None:
+        key = os.environ.get("DIABLO_UDP_RELAY_KEY", os.environ.get("DIABLO_CLUSTER_RELAY_KEY", ""))
+        if not key:
+            raise RuntimeError("DIABLO_UDP_RELAY_KEY is not set")
+        signature = str(request.get("sig", ""))
+        payload = dict(request)
+        payload.pop("sig", None)
+        expected = _relay_signature(key, payload)
+        if not hmac.compare_digest(signature, expected):
+            raise RuntimeError("invalid UDP relay signature")
+
+    def _stop_udp_relay(self) -> None:
+        self._udp_relay_stop.set()
+        if self._udp_relay_socket is not None:
+            try:
+                self._udp_relay_socket.close()
+            except OSError:
+                pass
+            self._udp_relay_socket = None
+        if self._udp_relay_thread is not None:
+            self._udp_relay_thread.join(timeout=1.0)
+            self._udp_relay_thread = None
+
     def shutdown(self) -> None:
+        self._stop_udp_relay()
         try:
             self.stop()
         except Exception as exc:  # pragma: no cover - best effort shutdown
@@ -990,6 +1104,8 @@ class DiabloRobotBridge:
             self.publisher.publish(msg)
 
     def _wait_for_motion_subscriber(self) -> None:
+        if not _env_bool("DIABLO_CLUSTER_REQUIRE_SUBSCRIBER", True):
+            return
         if self.wait_for_subscriber_ms <= 0:
             return
         if self._motion_subscriber_seen and self.publisher.get_subscription_count() > 0:
@@ -1189,72 +1305,6 @@ class JsonRpcMcpServer:
         sys.stdout.flush()
 
 
-def serve_domain_worker() -> None:
-    """Serve direct JSON commands for one persistent ROS domain worker."""
-
-    robot = DiabloRobotBridge()
-    try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            response: JsonDict
-            request_id: Any = None
-            try:
-                request = json.loads(line)
-                request_id = request.get("id")
-                method = request.get("method")
-                params = request.get("params") or {}
-                if method in ("warm", "ready"):
-                    robot._wait_for_motion_subscriber()
-                    subscriber_count = robot.publisher.get_subscription_count()
-                    if (
-                        method == "ready"
-                        and _env_bool("DIABLO_CLUSTER_REQUIRE_SUBSCRIBER", True)
-                        and subscriber_count == 0
-                    ):
-                        raise RuntimeError(
-                            "no motion subscriber on /%s in ROS_DOMAIN_ID=%s"
-                            % (robot.motion_topic, os.environ.get("ROS_DOMAIN_ID", ""))
-                        )
-                    response = {
-                        "id": request_id,
-                        "result": {
-                            "ok": True,
-                            "robot_name": robot.robot_name,
-                            "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
-                            "subscriber_count": subscriber_count,
-                        },
-                    }
-                elif method == "call_tool":
-                    name = str(params.get("name"))
-                    if name != "robot_get_status" and _env_bool("DIABLO_CLUSTER_REQUIRE_SUBSCRIBER", True):
-                        robot._wait_for_motion_subscriber()
-                        if robot.publisher.get_subscription_count() == 0:
-                            raise RuntimeError(
-                                "no motion subscriber on /%s in ROS_DOMAIN_ID=%s"
-                                % (robot.motion_topic, os.environ.get("ROS_DOMAIN_ID", ""))
-                            )
-                    result = robot.call_tool(name, params.get("arguments") or {})
-                    response = {
-                        "id": request_id,
-                        "result": {
-                            "ok": True,
-                            "robot_name": robot.robot_name,
-                            "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
-                            "tool_result": result,
-                        },
-                    }
-                else:
-                    response = {"id": request_id, "error": "unknown worker method: %s" % method}
-            except Exception as exc:
-                response = {"id": request_id, "error": str(exc)}
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-    finally:
-        robot.shutdown()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Diablo robot MCP stdio server")
     parser.add_argument(
@@ -1262,16 +1312,7 @@ def main() -> None:
         action="store_true",
         help="Print tool definitions as JSON and exit after initializing ROS.",
     )
-    parser.add_argument(
-        "--domain-worker",
-        action="store_true",
-        help="Run as an internal persistent worker for one ROS domain.",
-    )
     args = parser.parse_args()
-
-    if args.domain_worker:
-        serve_domain_worker()
-        return
 
     robot = DiabloRobotBridge()
     try:

@@ -15,12 +15,11 @@
 
 ---
 
-![diablo_robot_render](./docs/img/diablo_robot_render.jpg)
+![diablo_robot_render](./docs/img/bg.png)
 
 ## Basic Information 基本信息
 
 - `X3pi` 默认用户是 `root` , 密码为 `root`
-
   > 树莓派中默认用户是 `diablo` ,密码为 `diablo123`
 
 - `X3pi` 中IO默认串口号是 `/dev/ttyS3`
